@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# skillsmith-drift-check — SessionStart hook. Emits up to two short lines into
+# session context: a drift warning (SKILL.md changed after the last sync) and/or
+# a cadence nudge (skillsmith itself is overdue). Silent when all is well.
+# --mark-synced: update the stamp manually. --set-cadence N: nudge every N days.
+# Always exits 0 — never blocks a session. Internal errors go to a local log.
+
+exec 2>>"$HOME/.claude/skillsmith-drift.log"
+
+STAMP="$HOME/.claude/.skillsmith-last-sync"
+CADENCE_FILE="$HOME/.claude/.skillsmith-cadence"   # integer: nudge when last run is this many days old
+
+if [ "${1:-}" = "--mark-synced" ]; then
+  touch "$STAMP"; echo "marked synced"; exit 0
+fi
+if [ "${1:-}" = "--set-cadence" ] && [ -n "${2:-}" ]; then
+  printf '%s\n' "$2" > "$CADENCE_FILE"
+  # The cadence epoch starts now — also create the stamp if missing, otherwise
+  # the whole subsystem is silently dead until the first sync ever runs.
+  [ -f "$STAMP" ] || touch "$STAMP"
+  echo "cadence set: every $2 days"; exit 0
+fi
+
+# No stamp yet = neither a sync nor cadence setup has ever run; stay quiet
+# rather than nag every session forever
+[ -f "$STAMP" ] || exit 0
+
+# GNU first: BSD `stat -c` fails cleanly, but GNU `stat -f` "succeeds" with
+# filesystem info (the mount point), silently breaking the age arithmetic.
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+
+# Cadence nudge: skillsmith itself is overdue (opt-in via --set-cadence)
+if [ -f "$CADENCE_FILE" ]; then
+  CADENCE=$(tr -dc '0-9' < "$CADENCE_FILE")
+  if [ -n "$CADENCE" ] && [ "$CADENCE" -gt 0 ]; then
+    AGE_DAYS=$(( ( $(date +%s) - $(mtime_of "$STAMP") ) / 86400 ))
+    [ "$AGE_DAYS" -ge "$CADENCE" ] && \
+      echo "⏰ skillsmith cadence: last run was ${AGE_DAYS} days ago (target: every ${CADENCE}) — run \`skillsmith\` when convenient."
+  fi
+fi
+
+# Drift: -L follows symlinks (dotfiles/stow setups) both for traversal and for
+# comparing the TARGET's mtime, not the symlink's
+CHANGED=$(find -L "$HOME/.claude/skills" -name 'SKILL.md' -newer "$STAMP" 2>/dev/null \
+  | sed "s|$HOME/.claude/skills/||; s|/SKILL.md||" | sort | tr '\n' ' ')
+
+if [ -n "$CHANGED" ]; then
+  echo "⚠️ skillsmith drift: skill(s) edited since last alias sync: ${CHANGED}— if triggers/aliases changed, run the skillsmith Stage B sync (or ~/.claude/bin/skillsmith-drift-check --mark-synced if no alias impact)."
+fi
+exit 0
