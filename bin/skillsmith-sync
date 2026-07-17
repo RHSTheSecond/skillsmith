@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """skillsmith-sync — deterministic, validated splice of the skillsmith-managed
-index block into CLAUDE.md. Hardened by two rounds of adversarial review.
+index block into CLAUDE.md. Hardened by three rounds of adversarial review.
 
 Usage:
-  skillsmith-sync <block-content-file> [--claude-md PATH] [--dry-run] [--allow-empty]
-  skillsmith-sync --init [--claude-md PATH] [--dry-run]
+  skillsmith-sync <block-content-file> [--claude-md PATH] [--apply] [--allow-empty]
+  skillsmith-sync --init [--claude-md PATH] [--apply]
+  skillsmith-sync --version
+
+SAFE BY DEFAULT: with no --apply the tool DRY-RUNS (shows the diff, writes
+nothing). Writing to CLAUDE.md requires an explicit --apply token on the command
+line, so a lazy or degraded caller fails safe (shows the diff) instead of
+failing hot (writes unseen). --dry-run is accepted as an explicit no-op alias.
 
 The content file holds ONLY what goes BETWEEN the markers (not the markers).
 --init appends an empty marker pair to a CLAUDE.md that has none (creates the
 file if missing) — the deterministic first-run path; never hand-insert markers.
 
 Exit codes:
-  0 = ok (or clean no-op)      1 = marker anomaly in CLAUDE.md (fix that file)
+  0 = ok (or clean no-op / dry-run)   1 = marker anomaly in CLAUDE.md (fix it)
   2 = post-write verify failed (backup path printed)
   3 = usage / IO / internal error — CLAUDE.md was NOT modified
 """
@@ -23,6 +29,8 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+
+__version__ = "1.0.0"
 
 BEGIN = "<!-- skillsmith:index:begin -->"
 END = "<!-- skillsmith:index:end -->"
@@ -36,9 +44,14 @@ def fail(code, msg):
     sys.exit(code)
 
 
+def read_md(path):
+    # newline="" preserves the file's line endings verbatim (no universal-newline
+    # normalization), so a CRLF CLAUDE.md is never silently rewritten to LF and
+    # verification is a true byte round-trip.
+    return path.read_text(encoding="utf-8", newline="")
+
+
 def backup_dir_for(md_path):
-    # Default target backs up to ~/.claude/backups; custom targets back up
-    # beside themselves so test runs never pollute the real backup pool.
     if md_path == DEFAULT_MD:
         return Path.home() / ".claude" / "backups"
     return md_path.parent / ".skillsmith-backups"
@@ -49,21 +62,19 @@ def make_backup(md_path):
     bdir.mkdir(parents=True, exist_ok=True)
     backup = bdir / f"{md_path.name}.{datetime.now():%Y%m%d-%H%M%S%f}"
     shutil.copy2(md_path, backup)
-    # rotate: keep the newest BACKUP_KEEP for this filename
-    siblings = sorted(bdir.glob(f"{md_path.name}.*"), reverse=True)
-    for old in siblings[BACKUP_KEEP:]:
+    for old in sorted(bdir.glob(f"{md_path.name}.*"), reverse=True)[BACKUP_KEEP:]:
         old.unlink(missing_ok=True)
     return backup
 
 
 def atomic_write(md_path, text):
-    """Write via temp file + os.replace on the RESOLVED target, so a crash
-    mid-write can't truncate the file and symlinked CLAUDE.md setups keep
-    their symlink intact (we replace the target, not the link)."""
+    """Temp file + os.replace on the RESOLVED target: a crash mid-write can't
+    truncate the file, and symlinked CLAUDE.md setups keep their symlink (we
+    replace the target, not the link). newline="" writes bytes as given."""
     real = md_path.resolve()
     fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=f".{real.name}.")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -76,41 +87,58 @@ def atomic_write(md_path, text):
         raise
 
 
-def show_diff(original, updated, dry):
+def show_diff(original, updated, will_write):
     diff = list(difflib.unified_diff(
         original.splitlines(), updated.splitlines(),
         "CLAUDE.md (current)", "CLAUDE.md (new)", lineterm="", n=1))
-    # The dry-run diff is the approval surface — it must be complete. Long
-    # diffs go to a file so nothing is ever approved unseen.
     if len(diff) > 120:
-        dfile = Path(tempfile.gettempdir()) / f"skillsmith-diff-{datetime.now():%H%M%S}.diff"
+        # Overflow diff goes to a 0600 file under the backup dir — never
+        # world-readable /tmp (it can contain the user's whole CLAUDE.md).
+        bdir = Path.home() / ".claude" / "backups"
+        bdir.mkdir(parents=True, exist_ok=True)
+        dfile = bdir / f"skillsmith-diff-{datetime.now():%Y%m%d-%H%M%S%f}.diff"
         dfile.write_text("\n".join(diff), encoding="utf-8")
+        os.chmod(dfile, 0o600)
         print("\n".join(diff[:120]))
-        print(f"... {len(diff) - 120} more lines — FULL diff: {dfile}")
-        if dry:
+        print(f"... {len(diff) - 120} more lines — FULL diff (mode 600): {dfile}")
+        if not will_write:
             print("(approval surface: read the full diff file before approving)")
     else:
         print("\n".join(diff))
 
 
+def finish_dry(will_write):
+    if not will_write:
+        print("dry-run: no write performed (pass --apply to write)")
+        return True
+    return False
+
+
 def run(args):
     md_path = Path(args.claude_md).expanduser() if args.claude_md else DEFAULT_MD
+    will_write = args.apply
 
     if args.init:
         block = f"\n{BEGIN}\n{END}\n"
-        if md_path.is_file():
-            original = md_path.read_text(encoding="utf-8")
+        exists = md_path.is_file()
+        if exists:
+            original = read_md(md_path)
             if BEGIN in original or END in original:
                 fail(1, "markers already present — --init is only for first-time setup")
             updated = original.rstrip("\n") + "\n" + block
         else:
             original, updated = "", block.lstrip("\n")
-        show_diff(original, updated, args.dry_run)
-        if args.dry_run:
-            print("dry-run: no write performed")
+        show_diff(original, updated, will_write)
+        if finish_dry(will_write):
             return
-        backup = make_backup(md_path) if md_path.is_file() else None
-        atomic_write(md_path, updated) if md_path.is_file() else md_path.write_text(updated, encoding="utf-8")
+        backup = make_backup(md_path) if exists else None
+        if exists:
+            atomic_write(md_path, updated)
+        else:
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(updated, encoding="utf-8", newline="")
+        if md_path == DEFAULT_MD:
+            STAMP.touch()  # establish the drift baseline immediately
         print(f"OK: empty marker pair added to {md_path}"
               + (f" · backup: {backup}" if backup else " (file created)"))
         return
@@ -121,13 +149,13 @@ def run(args):
     if not md_path.is_file():
         fail(3, f"CLAUDE.md not found: {md_path} (use --init to create) — nothing modified")
 
-    new_block = content_file.read_text(encoding="utf-8").strip("\n")
+    new_block = content_file.read_text(encoding="utf-8", newline="").strip("\n")
     if BEGIN in new_block or END in new_block:
         fail(3, "content file must NOT contain the markers themselves — CLAUDE.md untouched")
     if not new_block.strip() and not args.allow_empty:
         fail(3, "content file is empty — refusing to wipe the block (--allow-empty to override); CLAUDE.md untouched")
 
-    original = md_path.read_text(encoding="utf-8")
+    original = read_md(md_path)
     n_begin, n_end = original.count(BEGIN), original.count(END)
     if (n_begin, n_end) != (1, 1):
         fail(1, f"marker anomaly: {n_begin}x begin / {n_end}x end (need exactly 1 each) "
@@ -140,36 +168,39 @@ def run(args):
 
     if updated == original:
         print("no-op: block already identical (idempotent ✓)")
-        if not args.dry_run and md_path == DEFAULT_MD:
+        if will_write and md_path == DEFAULT_MD:
             STAMP.touch()
         return
 
-    show_diff(original, updated, args.dry_run)
-    if args.dry_run:
-        print("dry-run: no write performed")
+    show_diff(original, updated, will_write)
+    if finish_dry(will_write):
         return
 
     backup = make_backup(md_path)
     try:
         atomic_write(md_path, updated)
-        reread = md_path.read_text(encoding="utf-8")
+        reread = read_md(md_path)
     except BaseException as e:
         fail(2, f"write failed ({e}) — original preserved at backup: {backup}")
     if reread.encode("utf-8") != updated.encode("utf-8"):
-        fail(2, f"post-write verification FAILED — restore from backup: {backup}")
+        fail(2, f"post-write verification FAILED (byte mismatch) — restore from backup: {backup}")
     if md_path == DEFAULT_MD:
         STAMP.touch()
-    print(f"OK: block updated + verified · backup: {backup}")
+    print(f"OK: block updated + byte-verified · backup: {backup}")
 
 
 def main():
     p = argparse.ArgumentParser(add_help=True)
     p.add_argument("content_file", nargs="?", help="file holding the new between-markers content")
     p.add_argument("--claude-md", help=f"target file (default: {DEFAULT_MD})")
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--apply", action="store_true", help="actually write (default is dry-run)")
+    p.add_argument("--dry-run", action="store_true", help="explicit no-op alias (default behavior)")
     p.add_argument("--allow-empty", action="store_true")
     p.add_argument("--init", action="store_true", help="append an empty marker pair (first-run setup)")
+    p.add_argument("--version", action="version", version=f"skillsmith-sync {__version__}")
     args = p.parse_args()
+    if args.dry_run:
+        args.apply = False
     if not args.init and not args.content_file:
         p.print_usage(sys.stderr)
         fail(3, "content file required (or use --init) — nothing modified")

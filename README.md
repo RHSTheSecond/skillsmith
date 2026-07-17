@@ -2,7 +2,7 @@
 
 **Forge new Claude Code skills from your own usage. Keep the ones you have sharp.**
 
-Skillsmith is a [Claude Code](https://claude.com/claude-code) skill that maintains your *skill ecosystem*: it audits your skill library, keeps your CLAUDE.md aliases in sync, mines your own session transcripts for repeated workflows that deserve to become skills, tunes descriptions so skills self-invoke at the right moments, and measures which skills actually fire.
+Skillsmith is a [Claude Code](https://claude.com/claude-code) skill that maintains your *skill ecosystem*: it audits your skill library, keeps your CLAUDE.md aliases in sync, mines your own session transcripts for repeated workflows that deserve to become skills, tunes descriptions so skills self-invoke at the right moments, and audits which skills actually fire (from your transcripts — prose-driven; see *Honest limits*).
 
 **Data flow, stated plainly:** the helper scripts run entirely locally. The skill itself runs inside Claude Code, so anything it analyzes — including transcript excerpts during session mining — is processed by Claude, the same exposure as the sessions themselves. Nothing goes to any *additional* third party, and the mining stage is opt-in, scoped, and cleans up its intermediate file. If your transcripts contain material that must never transit an LLM API, don't run the mining stage on them.
 
@@ -34,46 +34,74 @@ Skillsmith maintains the split that exploits both: procedures live in skill file
 - **Chains are offers.** A skill may say "this is what X handles — run it?" It never runs X for you.
 - **Fail loud.** Empty extraction aborts rather than reporting "no findings." Marker anomalies refuse rather than guess. A skill that fails to load is reported, never improvised from memory.
 
+## What's code, what's prompt
+
+Skillsmith's honesty rests on being clear about which guarantees are enforced by the scripts (reliable) and which are the skill's instructions to Claude (best-effort). Trust the first column; treat the second as judgment that can vary.
+
+| Property | Enforced by |
+|---|---|
+| No unapproved CLAUDE.md write | **code** — `skillsmith-sync` dry-runs unless `--apply` |
+| Marker validation / refuse-on-anomaly | **code** — `skillsmith-sync` |
+| Backups + atomic + byte-verified writes | **code** — `skillsmith-sync` |
+| Drift detection at session start | **code** — `skillsmith-drift-check` hook |
+| Mining scope + exclusions + corpus cleanup | **code** — `skillsmith-extract` (0600 temp, caller's cleanup trap) |
+| *Which* patterns become skills | prompt — the skill's judgment |
+| Approval wording, taint review, chain offers | prompt — the skill's instructions |
+| Usage audit ("which skills fired") | prompt — reads transcripts, no shipped parser |
+
 ## Install
 
+### As a plugin (experimental)
+
+The repo ships a plugin manifest (`.claude-plugin/plugin.json`) that bundles the skill
+**and** the SessionStart drift hook, so a plugin install skips the manual `settings.json`
+step and gives you version/update tracking. In Claude Code:
+
 ```bash
-# 1. The skill
-mkdir -p ~/.claude/skills/skillsmith
-cp skill/SKILL.md ~/.claude/skills/skillsmith/
-
-# 2. The scripts
-mkdir -p ~/.claude/bin
-cp bin/skillsmith-sync bin/skillsmith-drift-check ~/.claude/bin/
-chmod +x ~/.claude/bin/skillsmith-sync ~/.claude/bin/skillsmith-drift-check
-
-# 3. (Recommended) the drift hook — see below
+/plugin marketplace add RHSTheSecond/skillsmith
+/plugin install skillsmith@skillsmith
 ```
 
-**The drift hook.** If you have no `~/.claude/settings.json` yet, this complete file works as-is:
+Plugin skills are namespaced — invoke as **`skillsmith:skillsmith`** (or let it
+self-invoke), and confirm the hook with `/hooks`. *The exact command sequence is still
+being validated across Claude Code versions; if it doesn't resolve, use the manual
+install below — it's the fully tested path.*
+
+### Manual install
+
+```bash
+git clone https://github.com/RHSTheSecond/skillsmith && cd skillsmith
+mkdir -p ~/.claude/skills/skillsmith ~/.claude/bin
+cp skills/skillsmith/SKILL.md ~/.claude/skills/skillsmith/
+cp bin/skillsmith-* ~/.claude/bin/ && chmod +x ~/.claude/bin/skillsmith-*
+```
+
+Then add the drift hook. If you have **no** `~/.claude/settings.json`, this complete file works as-is:
 
 ```json
 {
   "hooks": {
     "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/bin/skillsmith-drift-check || true",
-            "timeout": 10
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "~/.claude/bin/skillsmith-drift-check || true", "timeout": 10 } ] }
     ]
   }
 }
 ```
 
-If you already have a `settings.json`: merge — add the `"SessionStart"` array into your existing `"hooks"` object (or the whole `"hooks"` key if you have none), don't replace the file. Validate afterwards: `jq . ~/.claude/settings.json`. Script errors, if any, land in `~/.claude/skillsmith-drift.log`.
+If you **already have** a `settings.json`, merge instead of replacing — this preserves your existing hooks:
 
-Then, in any Claude Code session: **`skillsmith`**. The first run asks how often you want to be nudged to run it again (the SessionStart hook delivers the nudge); without the hook, a calendar reminder works fine.
+```bash
+jq '.hooks.SessionStart += [{"hooks":[{"type":"command","command":"~/.claude/bin/skillsmith-drift-check || true","timeout":10}]}]' \
+  ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json
+```
 
-First run: skillsmith initializes the managed index markers in your CLAUDE.md via `skillsmith-sync --init` (shown as a diff, applied on your approval — the same validated path as every later write; it never hand-edits your file). After that the script owns everything between the markers. Backups of every write land in `~/.claude/backups/` (newest 20 kept).
+Then run `/hooks` and confirm a User SessionStart command hook appears. Script errors, if any, land in `~/.claude/skillsmith-drift.log`.
+
+### First run
+
+In any Claude Code session: **`skillsmith`**. It initializes the managed index markers in your CLAUDE.md via `skillsmith-sync --init` (shown as a diff, written only on your approval — never a hand-edit), then asks how often to nudge you to run it again (`0` = never). Backups of every write land in `~/.claude/backups/` (newest 20 kept).
+
+**Scope note:** skillsmith manages only your **global** `~/.claude/CLAUDE.md`. Project-level `CLAUDE.md` files are out of scope.
 
 ## Personal customization: LOCAL.md
 
@@ -82,7 +110,7 @@ Drop a `LOCAL.md` next to the installed SKILL.md for machine-specific extensions
 ## Requirements
 
 - Claude Code with skills support (`~/.claude/skills/`)
-- `python3` (the sync script); `jq` helps transcript extraction (without it, the skill writes a small python extractor at runtime — workable, but a different reliability class)
+- `python3` ≥ 3.8 (the sync + extract scripts)
 - macOS or Linux
 
 ## Honest limits

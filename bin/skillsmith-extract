@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""skillsmith-extract — deterministic, privacy-guarded extraction of the user's
+own messages from Claude Code session transcripts, for skillsmith Stage C mining.
+
+Moves the scope/exclusion/cleanup invariants out of skill prose into code:
+  - --scope current mines ONLY the current project; --scope all mines every project
+    (a broader exposure — the skill must warn before choosing it)
+  - excludes the current session and any session where the `skillsmith` skill fired
+    (prevents self-inflation of frequency evidence)
+  - user-role text only; drops tool results, system reminders, command wrappers
+  - corpus sanity floor: aborts (exit 4) if extraction is implausibly thin for the
+    session count, rather than reporting a false "no candidates"
+  - each line carries the message's ISO timestamp (cadence detection depends on it)
+  - the corpus file is created 0600 and is NOT auto-deleted here; the CALLER owns
+    its lifecycle. Prefer the wrapper form below so cleanup is trap-guaranteed:
+        CORPUS=$(skillsmith-extract --scope current --days 14 --print-path)
+        trap 'rm -f "$CORPUS"' EXIT INT TERM
+
+Usage:
+  skillsmith-extract [--scope current|all] [--days N] [--project SLUG]
+                     [--exclude-session UUID] [--min-per-session F] [--print-path]
+  skillsmith-extract --version
+
+Output: prints the corpus path (always). Each corpus line:
+  <iso-timestamp>\t<project-slug>\t<session8>\t<message text, newlines->⏎>
+Exit codes: 0 ok · 3 usage/IO · 4 corpus sanity floor tripped (schema drift?)
+"""
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+PROJECTS = Path.home() / ".claude" / "projects"
+MAX_LEN = 1500
+NOISE_PREFIXES = ("<system-reminder", "<command-", "<local-command", "Caveat:",
+                  "[Request interrupted", "<task-notification",
+                  "This session is being continued", "<local-command-stdout")
+
+
+def fail(code, msg):
+    print(f"skillsmith-extract: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def session_fired_skillsmith(jsonl):
+    """True if a Skill(skillsmith) tool_use appears anywhere in this session —
+    those sessions are excluded so mining never re-mines its own candidate talk."""
+    try:
+        with open(jsonl, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"skillsmith"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = (ev.get("message") or {}).get("content")
+                if isinstance(content, list):
+                    for b in content:
+                        if (isinstance(b, dict) and b.get("type") == "tool_use"
+                                and b.get("name") == "Skill"
+                                and (b.get("input") or {}).get("skill") == "skillsmith"):
+                            return True
+    except OSError:
+        pass
+    return False
+
+
+def extract():
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--scope", choices=("current", "all"), default="current")
+    p.add_argument("--days", type=int, default=14)
+    p.add_argument("--project", help="project slug for --scope current (default: cwd-derived)")
+    p.add_argument("--exclude-session", action="append", default=[],
+                   help="session UUID(s) to exclude (e.g. the live session)")
+    p.add_argument("--min-per-session", type=float, default=3.0,
+                   help="corpus sanity floor: min avg messages/session before abort")
+    p.add_argument("--print-path", action="store_true", help="(default) print corpus path")
+    p.add_argument("--version", action="version", version=f"skillsmith-extract {__version__}")
+    args = p.parse_args()
+
+    if not PROJECTS.is_dir():
+        fail(3, f"no transcripts dir: {PROJECTS}")
+
+    cutoff = time.time() - args.days * 86400
+    if args.scope == "current":
+        slug = args.project or str(Path.cwd()).replace("/", "-")
+        roots = [PROJECTS / slug]
+        if not roots[0].is_dir():
+            # cwd-derived slug may not match exactly; fall back to substring match
+            base = Path.cwd().name
+            roots = [d for d in PROJECTS.iterdir() if d.is_dir() and base in d.name] or roots
+    else:
+        roots = [d for d in PROJECTS.iterdir() if d.is_dir()]
+
+    excluded = set(args.exclude_session)
+    fd, corpus = tempfile.mkstemp(prefix="skillsmith-corpus-", suffix=".tsv")
+    os.close(fd)
+    os.chmod(corpus, 0o600)
+
+    lines, sessions = 0, set()
+    with open(corpus, "w", encoding="utf-8") as out:
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for f in root.glob("*.jsonl"):
+                if f.stem in excluded or f.stat().st_mtime < cutoff:
+                    continue
+                if session_fired_skillsmith(f):
+                    continue
+                proj = root.name.replace("-Users-", "").replace("-", "/", 2)
+                sid = f.stem[:8]
+                try:
+                    with open(f, encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            try:
+                                ev = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if ev.get("type") != "user":
+                                continue
+                            content = (ev.get("message") or {}).get("content")
+                            if isinstance(content, str):
+                                text = content
+                            elif isinstance(content, list):
+                                text = " ".join(b.get("text", "") for b in content
+                                                if isinstance(b, dict) and b.get("type") == "text")
+                            else:
+                                continue
+                            text = text.strip()
+                            if not text or len(text) > MAX_LEN:
+                                continue
+                            if any(text.startswith(pre) for pre in NOISE_PREFIXES):
+                                continue
+                            ts = ev.get("timestamp", "")
+                            sessions.add(f.stem)
+                            out.write(f"{ts}\t{proj}\t{sid}\t{text.replace(chr(10), ' ⏎ ')}\n")
+                            lines += 1
+                except OSError:
+                    continue
+
+    n_sessions = len(sessions)
+    if n_sessions and lines < args.min_per_session * n_sessions:
+        os.unlink(corpus)
+        fail(4, f"corpus sanity floor tripped: only {lines} messages from {n_sessions} "
+                f"sessions (< {args.min_per_session}/session) — likely transcript schema "
+                f"drift; ABORTING rather than reporting a false 'no candidates'.")
+
+    print(corpus)
+    print(f"# {lines} messages from {n_sessions} sessions "
+          f"(scope={args.scope}, {args.days}d)", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    extract()

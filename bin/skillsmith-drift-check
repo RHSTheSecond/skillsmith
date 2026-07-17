@@ -14,12 +14,24 @@ if [ "${1:-}" = "--mark-synced" ]; then
   touch "$STAMP"; echo "marked synced"; exit 0
 fi
 if [ "${1:-}" = "--set-cadence" ] && [ -n "${2:-}" ]; then
+  # Validate at SET time (fail loud), not silently at read time. 0 = never.
+  case "$2" in
+    ''|*[!0-9]*) echo "skillsmith: cadence must be a non-negative integer (0 = never), got: $2" >&2; exit 1 ;;
+  esac
   printf '%s\n' "$2" > "$CADENCE_FILE"
   # The cadence epoch starts now — also create the stamp if missing, otherwise
   # the whole subsystem is silently dead until the first sync ever runs.
   [ -f "$STAMP" ] || touch "$STAMP"
-  echo "cadence set: every $2 days"; exit 0
+  if [ "$2" -eq 0 ]; then echo "cadence set: never (nudges off)"; else echo "cadence set: every $2 days"; fi
+  exit 0
 fi
+if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.0.0"; exit 0; fi
+
+# Backstop GC: delete stale mining-corpus corpses (the concentrated 14-day
+# aggregate) if a Stage C run was abandoned before its own cleanup ran.
+for corpse in "${TMPDIR:-/tmp}"/skillsmith-corpus-* "$HOME/.claude/tmp"/user_messages.txt; do
+  [ -f "$corpse" ] && find "$corpse" -mmin +120 -delete 2>/dev/null
+done
 
 # No stamp yet = neither a sync nor cadence setup has ever run; stay quiet
 # rather than nag every session forever
