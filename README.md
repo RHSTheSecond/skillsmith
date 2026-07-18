@@ -51,21 +51,30 @@ Skillsmith's honesty rests on being clear about which guarantees are enforced by
 
 ## Install
 
-### As a plugin (experimental)
+### As a plugin
 
-The repo ships a plugin manifest (`.claude-plugin/plugin.json`) that bundles the skill
-**and** the SessionStart drift hook, so a plugin install skips the manual `settings.json`
-step and gives you version/update tracking. In Claude Code:
+The repo is its own single-plugin marketplace (`.claude-plugin/marketplace.json`) and
+ships a plugin manifest that bundles the skill **and** the SessionStart drift hook, so a
+plugin install skips the manual `settings.json` step and gives you version/update
+tracking. In Claude Code:
 
 ```bash
 /plugin marketplace add RHSTheSecond/skillsmith
 /plugin install skillsmith@skillsmith
 ```
 
+Or non-interactively from a shell:
+
+```bash
+claude plugin marketplace add RHSTheSecond/skillsmith
+claude plugin install skillsmith@skillsmith
+```
+
 Plugin skills are namespaced — invoke as **`skillsmith:skillsmith`** (or let it
-self-invoke), and confirm the hook with `/hooks`. *The exact command sequence is still
-being validated across Claude Code versions; if it doesn't resolve, use the manual
-install below — it's the fully tested path.*
+self-invoke). The drift hook registers automatically with the install — no
+`settings.json` edit; confirm with `/hooks` or `claude plugin details skillsmith`.
+The helper scripts run from the plugin's install directory (the skill resolves them
+there when they aren't in `~/.claude/bin/`). Verified end-to-end on Claude Code 2.1.214.
 
 ### Manual install
 

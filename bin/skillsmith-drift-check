@@ -57,6 +57,6 @@ CHANGED=$(find -L "$HOME/.claude/skills" -name 'SKILL.md' -newer "$STAMP" 2>/dev
   | sed "s|$HOME/.claude/skills/||; s|/SKILL.md||" | sort | tr '\n' ' ')
 
 if [ -n "$CHANGED" ]; then
-  echo "⚠️ skillsmith drift: skill(s) edited since last alias sync: ${CHANGED}— if triggers/aliases changed, run the skillsmith Stage B sync (or ~/.claude/bin/skillsmith-drift-check --mark-synced if no alias impact)."
+  echo "⚠️ skillsmith drift: skill(s) edited since last alias sync: ${CHANGED}— if triggers/aliases changed, run the skillsmith Stage B sync (or \`$0 --mark-synced\` if no alias impact)."
 fi
 exit 0

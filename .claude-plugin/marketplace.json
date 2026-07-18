@@ -1,0 +1,19 @@
+{
+  "name": "skillsmith",
+  "owner": { "name": "Richard Schmidt II" },
+  "metadata": {
+    "description": "Marketplace for the skillsmith plugin — Claude Code skill-ecosystem maintenance.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "skillsmith",
+      "source": "./",
+      "description": "Skill-ecosystem maintenance for Claude Code: audit your skills, sync CLAUDE.md aliases, mine your own sessions for should-be-skills, tune self-invocation. Code for invariants, prose for judgment.",
+      "version": "1.0.0",
+      "author": { "name": "Richard Schmidt II" },
+      "license": "MIT",
+      "homepage": "https://github.com/RHSTheSecond/skillsmith"
+    }
+  ]
+}

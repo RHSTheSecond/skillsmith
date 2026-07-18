@@ -12,7 +12,8 @@ A staged maintenance pass over the user's Claude Code skill ecosystem. Stages A+
 - **Suggest-then-approve, NO exceptions** — every mutation (file edits, new skills, description rewrites, and the managed block itself) is proposed first and applied only on explicit approval. CLAUDE.md changes in particular ALWAYS show the exact diff (`skillsmith-sync --dry-run`) and wait for a yes before writing — the always-loaded control file is never modified on implied consent.
 - **Single source of truth** — a skill's mechanics live ONLY in its SKILL.md. Never expand skill procedures into CLAUDE.md; CLAUDE.md gets one-line aliases that say "invoke the skill."
 - **Honest data-flow claim** — transcripts are processed by Claude (same exposure as the original sessions; subagent analysis is Claude API traffic) and never sent to any third party. The extracted corpus is a scratchpad file — delete it when the run ends.
-- **Determinism where no judgment is needed** — file surgery on CLAUDE.md goes through the validated script `~/.claude/bin/skillsmith-sync`, never raw LLM edits.
+- **Determinism where no judgment is needed** — file surgery on CLAUDE.md goes through the validated script `skillsmith-sync`, never raw LLM edits.
+- **Locating the helper scripts** (`skillsmith-sync`, `skillsmith-drift-check`, `skillsmith-extract`): a manual install puts them in `~/.claude/bin/`; a plugin install runs them from the plugin cache at `~/.claude/plugins/cache/<marketplace>/skillsmith/<version>/bin/`. Paths below say `~/.claude/bin/…` for the common (manual) case — if a script isn't there, resolve the plugin copy once (`ls -td ~/.claude/plugins/cache/*/skillsmith/*/bin 2>/dev/null | head -1`, newest install wins) and use that directory everywhere below. If neither location has them, STOP the affected stage and say the helper is missing; do not hand-roll it.
 
 ---
 

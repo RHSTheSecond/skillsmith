@@ -18,6 +18,10 @@ public-readiness.
 - `skillsmith-extract` (new): guarded transcript extraction — scope control, current +
   skillsmith-session exclusions, user-text-only, corpus sanity floor, `0600` temp file,
   ISO timestamp per line.
-- Packaged as a Claude Code plugin (skill + SessionStart hook together); manual
-  cp-install documented as a fallback.
+- Packaged as a Claude Code plugin: the repo doubles as its own single-plugin
+  marketplace (`.claude-plugin/marketplace.json`), so `/plugin marketplace add
+  RHSTheSecond/skillsmith` → `/plugin install skillsmith@skillsmith` works directly.
+  Install verified end-to-end on Claude Code 2.1.214 (marketplace add → install →
+  skill + SessionStart hook load from the plugin cache; `${CLAUDE_PLUGIN_ROOT}` hook
+  path and script exec bits confirmed). Manual cp-install documented as an alternative.
 - `--version` on all three scripts.
