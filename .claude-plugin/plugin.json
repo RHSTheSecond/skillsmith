@@ -1,6 +1,6 @@
 {
   "name": "skillsmith",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Skill-ecosystem maintenance for Claude Code: audit your skills, sync CLAUDE.md aliases, mine your own sessions for should-be-skills, tune self-invocation. Code for invariants, prose for judgment.",
   "author": { "name": "Richard Schmidt II" },
   "license": "MIT",

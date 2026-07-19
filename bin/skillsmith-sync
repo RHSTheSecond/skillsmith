@@ -30,7 +30,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 BEGIN = "<!-- skillsmith:index:begin -->"
 END = "<!-- skillsmith:index:end -->"

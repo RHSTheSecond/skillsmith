@@ -7,6 +7,13 @@
 
 exec 2>>"$HOME/.claude/skillsmith-drift.log"
 
+# Publish the bin dir of the copy that actually executes (manual ~/.claude/bin
+# or plugin cache) so SKILL.md resolves the helpers without guessing install
+# layout — the pointer is rewritten on every run, so it self-heals across
+# installs, updates, and mode switches.
+BIN_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) && \
+  printf '%s\n' "$BIN_DIR" > "$HOME/.claude/.skillsmith-bin"
+
 STAMP="$HOME/.claude/.skillsmith-last-sync"
 CADENCE_FILE="$HOME/.claude/.skillsmith-cadence"   # integer: nudge when last run is this many days old
 
@@ -25,7 +32,7 @@ if [ "${1:-}" = "--set-cadence" ] && [ -n "${2:-}" ]; then
   if [ "$2" -eq 0 ]; then echo "cadence set: never (nudges off)"; else echo "cadence set: every $2 days"; fi
   exit 0
 fi
-if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.0.0"; exit 0; fi
+if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.0.1"; exit 0; fi
 
 # Backstop GC: delete stale mining-corpus corpses (the concentrated 14-day
 # aggregate) if a Stage C run was abandoned before its own cleanup ran.

@@ -13,7 +13,13 @@ A staged maintenance pass over the user's Claude Code skill ecosystem. Stages A+
 - **Single source of truth** — a skill's mechanics live ONLY in its SKILL.md. Never expand skill procedures into CLAUDE.md; CLAUDE.md gets one-line aliases that say "invoke the skill."
 - **Honest data-flow claim** — transcripts are processed by Claude (same exposure as the original sessions; subagent analysis is Claude API traffic) and never sent to any third party. The extracted corpus is a scratchpad file — delete it when the run ends.
 - **Determinism where no judgment is needed** — file surgery on CLAUDE.md goes through the validated script `skillsmith-sync`, never raw LLM edits.
-- **Locating the helper scripts** (`skillsmith-sync`, `skillsmith-drift-check`, `skillsmith-extract`): a manual install puts them in `~/.claude/bin/`; a plugin install runs them from the plugin cache at `~/.claude/plugins/cache/<marketplace>/skillsmith/<version>/bin/`. Paths below say `~/.claude/bin/…` for the common (manual) case — if a script isn't there, resolve the plugin copy once (`ls -td ~/.claude/plugins/cache/*/skillsmith/*/bin 2>/dev/null | head -1`, newest install wins) and use that directory everywhere below. If neither location has them, STOP the affected stage and say the helper is missing; do not hand-roll it.
+- **Locating the helper scripts** (`skillsmith-sync`, `skillsmith-drift-check`, `skillsmith-extract`) — resolve `$SMITH_BIN` once, first; every command below uses it:
+  ```bash
+  SMITH_BIN=$(cat ~/.claude/.skillsmith-bin 2>/dev/null)  # pointer written by the drift hook = whichever install actually executes
+  [ -x "$SMITH_BIN/skillsmith-sync" ] || SMITH_BIN="$HOME/.claude/bin"  # manual install
+  [ -x "$SMITH_BIN/skillsmith-sync" ] || SMITH_BIN=$(ls -td ~/.claude/plugins/cache/skillsmith/skillsmith/*/bin 2>/dev/null | head -1)  # plugin cache, hook not yet run
+  ```
+  If none of the three resolves, STOP the affected stage and say the helpers are missing; do not hand-roll their behavior. This rule overrides any older stage-local fallback.
 
 ---
 
@@ -44,7 +50,7 @@ Goal: every worthy skill is reachable by a bare conversational word, because CLA
    Present the classification for override before writing.
 2. **Write the block via the validated script — NEVER by direct Edit:**
    - Compose the new block CONTENT (heading, one-sentence contract, the `trigger word(s) | skill | invoke when` table — content between the markers, not the markers themselves) into a scratchpad file.
-   - **The script DRY-RUNS by default (writing needs `--apply`).** Run `~/.claude/bin/skillsmith-sync <content-file>` (no `--apply`) to show the user the diff, get explicit approval, THEN run the same command with `--apply` to write. It validates exactly one `<!-- skillsmith:index:begin/end -->` marker pair, backs up CLAUDE.md to `~/.claude/backups/`, splices, byte-verifies. It REFUSES on marker anomalies — if it exits 1, fix CLAUDE.md by hand before retrying; if it exits 2, restore from the printed backup path; if it exits 3, an internal/usage error occurred and CLAUDE.md was NOT modified.
+   - **The script DRY-RUNS by default (writing needs `--apply`).** Run `"$SMITH_BIN"/skillsmith-sync <content-file>` (no `--apply`) to show the user the diff, get explicit approval, THEN run the same command with `--apply` to write. It validates exactly one `<!-- skillsmith:index:begin/end -->` marker pair, backs up CLAUDE.md to `~/.claude/backups/`, splices, byte-verifies. It REFUSES on marker anomalies — if it exits 1, fix CLAUDE.md by hand before retrying; if it exits 2, restore from the printed backup path; if it exits 3, an internal/usage error occurred and CLAUDE.md was NOT modified.
    - Idempotency is by construction: identical content → "no-op" from the script.
    - First-ever run (markers don't exist yet): `skillsmith-sync --init`, show the diff, then `skillsmith-sync --init --apply` on approval — it appends an empty marker pair (creating CLAUDE.md if absent) through the same backup/verify path and sets the drift baseline stamp. NEVER hand-insert the markers.
    - If the script itself is missing (new machine): STOP Stage B and say so — do not hand-splice.
@@ -56,13 +62,13 @@ Goal: every worthy skill is reachable by a bare conversational word, because CLA
 Find repeating patterns in recent sessions that deserve to become skills.
 
 0. **Ask scope before extracting:** current project only (default) or all projects. `--scope all` concentrates everything the user typed *everywhere* into one corpus — a broader exposure than any single session; state that explicitly when offering it.
-1. **Extract via the guarded script — do NOT hand-roll the jq.** `~/.claude/bin/skillsmith-extract` owns the invariants (scope, current-session + skillsmith-session exclusions, user-text-only, corpus sanity floor, 0600 perms, ISO timestamp per line). Run it under a cleanup trap so an abandoned stage can't leave the corpus behind:
+1. **Extract via the guarded script — do NOT hand-roll the jq.** `"$SMITH_BIN"/skillsmith-extract` owns the invariants (scope, current-session + skillsmith-session exclusions, user-text-only, corpus sanity floor, 0600 perms, ISO timestamp per line). Run it under a cleanup trap so an abandoned stage can't leave the corpus behind:
    ```bash
-   CORPUS=$(~/.claude/bin/skillsmith-extract --scope current --days 14 \
+   CORPUS=$("$SMITH_BIN"/skillsmith-extract --scope current --days 14 \
               --exclude-session "$CURRENT_SESSION_UUID")
    trap 'rm -f "$CORPUS"' EXIT INT TERM
    ```
-   Exit 4 = the sanity floor tripped (corpus implausibly thin for the session count → likely JSONL schema drift): STOP and say the extractor is broken; do NOT report "no candidates found." If the script is missing (bare install), fall back to the documented jq/python inline extraction, but say so — the guarantees above then rest on prose. Each corpus line is `iso-timestamp \t project \t session8 \t text` (the timestamp powers Stage-C-cadence in v1.1).
+   Exit 4 = the sanity floor tripped (corpus implausibly thin for the session count → likely JSONL schema drift): STOP and say the extractor is broken; do NOT report "no candidates found." If the script is missing (`$SMITH_BIN` didn't resolve), STOP Stage C and say so — the invariants above are code-enforced or absent; never hand-roll the extraction. Each corpus line is `iso-timestamp \t project \t session8 \t text` (the timestamp powers Stage-C-cadence in v1.1).
 2. **Analyze** (fan out to subagents if the corpus is large — give each a slice or a lens). Look for:
    - repeated similar requests ("summarize X and post it to Y" shapes)
    - repeated multi-step workflows described in prose each time
@@ -109,18 +115,18 @@ A skill that never activates is dead weight — and a task that matched a skill'
 
 Verdict-first, scannable: what was audited (counts), fixed, aliased, chained, proposed-but-declined, created. One line per item. If anything was deferred (e.g., user skipped Stage C), name it as an open loop.
 
-**Close-out stamp (feeds the drift hook):** on run completion, ensure `~/.claude/.skillsmith-last-sync` is current (the Stage-B script touches it automatically; `~/.claude/bin/skillsmith-drift-check --mark-synced` if Stage B didn't run).
+**Close-out stamp (feeds the drift hook):** on run completion, ensure `~/.claude/.skillsmith-last-sync` is current (the Stage-B script touches it automatically; `"$SMITH_BIN"/skillsmith-drift-check --mark-synced` if Stage B didn't run).
 
 ## First run — cadence setup
 
 If `~/.claude/.skillsmith-cadence` does not exist, this is the first run: ask the user how often they want to be nudged to run skillsmith (suggest 14 days; offer 7 / 14 / 30 / never), then persist it:
 
 ```bash
-~/.claude/bin/skillsmith-drift-check --set-cadence 14   # their number; 0 = never (do NOT skip the command — 0 records the choice so it isn't re-asked every run)
+"$SMITH_BIN"/skillsmith-drift-check --set-cadence 14   # their number; 0 = never (do NOT skip the command — 0 records the choice so it isn't re-asked every run)
 ```
 
 The SessionStart drift hook then nudges inside new sessions whenever the last run is older than the cadence. No hook installed → no nudge; say so and suggest a calendar reminder instead. (This is a nudge by design, not an unattended scheduled run — skillsmith is interactive; every mutation needs the user present to approve.)
 
 ## Local extensions (LOCAL.md)
 
-If a `LOCAL.md` exists in this skill's folder, read it and apply its additional steps at the points it names (extra close-out stamps, notification channels, environment-specific integrations). LOCAL.md is the user's personal overlay — it is NOT part of the distributed skill and is never assumed to exist.
+If a `LOCAL.md` exists in this skill's folder — or at `~/.claude/skillsmith/LOCAL.md`, the durable location for plugin installs (the plugin cache is replaced on update; a LOCAL.md inside it would be lost) — read it and apply its additional steps at the points it names (extra close-out stamps, notification channels, environment-specific integrations). LOCAL.md is the user's personal overlay — it is NOT part of the distributed skill and is never assumed to exist.

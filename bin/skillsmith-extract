@@ -33,7 +33,7 @@ import tempfile
 import time
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 PROJECTS = Path.home() / ".claude" / "projects"
 MAX_LEN = 1500

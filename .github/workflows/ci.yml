@@ -1,0 +1,50 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate manifests (strict)
+        run: |
+          claude plugin validate . --strict
+          claude plugin validate .claude-plugin/plugin.json --strict
+
+      - name: Version lockstep + hardcoded-path lint
+        run: |
+          set -euo pipefail
+          # plugin.json is the single version authority
+          PLUGIN_V=$(jq -re '.version' .claude-plugin/plugin.json)
+          jq -e '.plugins[0] | has("version") | not' .claude-plugin/marketplace.json >/dev/null \
+            || { echo "marketplace entry must not declare a version (plugin.json wins)"; exit 1; }
+          for s in bin/skillsmith-sync bin/skillsmith-extract bin/skillsmith-drift-check; do
+            grep -q "$PLUGIN_V" "$s" || { echo "$s version string != $PLUGIN_V"; exit 1; }
+          done
+          # the skill body must resolve scripts via $SMITH_BIN, never hardcoded paths
+          if grep -n '~/.claude/bin/skillsmith-' skills/skillsmith/SKILL.md; then
+            echo "SKILL.md contains hardcoded ~/.claude/bin/skillsmith-* paths"; exit 1
+          fi
+
+      - name: Smoke install (isolated config dir)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.claude"          # scripts assume a Claude Code machine
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/cc"
+          mkdir -p "$CLAUDE_CONFIG_DIR"
+          claude plugin marketplace add "$PWD"
+          claude plugin install skillsmith@skillsmith
+          claude plugin list | grep -q "enabled"
+          BIN=$(ls -td "$CLAUDE_CONFIG_DIR"/plugins/cache/skillsmith/skillsmith/*/bin | head -1)
+          "$BIN/skillsmith-sync" --version
+          "$BIN/skillsmith-extract" --version
+          "$BIN/skillsmith-drift-check" --version
+          # the drift hook must have published the bin pointer to the cache copy
+          grep -q "plugins/cache/skillsmith/skillsmith" "$HOME/.claude/.skillsmith-bin"

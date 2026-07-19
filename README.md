@@ -54,9 +54,10 @@ Skillsmith's honesty rests on being clear about which guarantees are enforced by
 ### As a plugin
 
 The repo is its own single-plugin marketplace (`.claude-plugin/marketplace.json`) and
-ships a plugin manifest that bundles the skill **and** the SessionStart drift hook, so a
-plugin install skips the manual `settings.json` step and gives you version/update
-tracking. In Claude Code:
+uses Claude Code's standard plugin layout — `skills/` and `hooks/hooks.json` are
+auto-discovered; `plugin.json` deliberately declares no component paths — so an install
+brings the skill **and** the SessionStart drift hook together, skips the manual
+`settings.json` step, and gives you version/update tracking. In Claude Code:
 
 ```bash
 /plugin marketplace add RHSTheSecond/skillsmith
@@ -73,8 +74,17 @@ claude plugin install skillsmith@skillsmith
 Plugin skills are namespaced — invoke as **`skillsmith:skillsmith`** (or let it
 self-invoke). The drift hook registers automatically with the install — no
 `settings.json` edit; confirm with `/hooks` or `claude plugin details skillsmith`.
-The helper scripts run from the plugin's install directory (the skill resolves them
-there when they aren't in `~/.claude/bin/`). Verified end-to-end on Claude Code 2.1.214.
+The hook publishes the running install's `bin/` path to `~/.claude/.skillsmith-bin`,
+and the skill resolves the helper scripts through that pointer — the same SKILL.md
+works for manual and plugin installs, across updates and mode switches. Install path
+verified on Claude Code 2.1.214 (local + GitHub marketplace add → install → skill and
+hook loaded); CI re-verifies the manifests and a full smoke install on every push.
+
+**Switching from manual to plugin install:** remove the manual copies so a stale
+version can't shadow the plugin's — `rm ~/.claude/bin/skillsmith-*`, delete the
+SessionStart hook entry from `~/.claude/settings.json` (the plugin brings its own;
+keeping both means duplicate drift lines every session), then start a new session so
+the plugin hook rewrites `~/.claude/.skillsmith-bin`.
 
 ### Manual install
 
@@ -114,7 +124,7 @@ In any Claude Code session: **`skillsmith`**. It initializes the managed index m
 
 ## Personal customization: LOCAL.md
 
-Drop a `LOCAL.md` next to the installed SKILL.md for machine-specific extensions (extra close-out stamps, notification channels, environment integrations). The skill applies it when present; the distributed skill never assumes it exists. Your quirks stay yours — the core stays shareable.
+Drop a `LOCAL.md` next to the installed SKILL.md — or, for plugin installs, at `~/.claude/skillsmith/LOCAL.md` (the plugin cache is replaced on update, so a file inside it would be lost) — for machine-specific extensions (extra close-out stamps, notification channels, environment integrations). The skill applies it when present; the distributed skill never assumes it exists. Your quirks stay yours — the core stays shareable.
 
 ## Requirements
 
@@ -131,7 +141,7 @@ Drop a `LOCAL.md` next to the installed SKILL.md for machine-specific extensions
 
 ## Roadmap
 
-- `skillsmith-extract` — move Stage C's transcript extraction (find + filters + exclusions + sanity floor + temp-file lifecycle) from LLM-executed instructions into a tested script, applying "code for invariants" one layer further.
+- **v1.1 "the ladder"** — grow Stage C from "should this be a skill?" into a promotion ladder (vocabulary → skill → script → agentic workflow → persistent agent): cadence detection from the extractor's timestamps, a 4-criterion promotion test, and agent-tier retirement auditing. Humans always promote; the loop only proposes.
 
 ---
 
