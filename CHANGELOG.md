@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.0.2 — 2026-07-18
+
+Fixes from an independent third-party code assessment (received hours after
+v1.0.1; its headline finding was real and is the reason this release exists).
+
+- **CRITICAL compat fix in `skillsmith-sync`:** the script called
+  `Path.read_text(newline="")` / `Path.write_text(newline="")` — parameters that
+  only exist since Python 3.13 / 3.10. On any older interpreter (including
+  Ubuntu 24.04's default 3.12) the centerpiece safety script died with a
+  TypeError on its very first read. It failed *safe* (exit 3, CLAUDE.md
+  untouched) but was completely nonfunctional despite a documented ≥3.8
+  requirement. Reproduced on 3.12, fixed with `open()`-based IO, and now proven
+  by the test suite on 3.8/3.12/latest in CI.
+- **Approved diff = applied diff:** dry-run prints `source sha256:`; `--apply
+  --expected-sha256 <hash>` refuses (exit 3, nothing written) if CLAUDE.md
+  changed between the reviewed dry run and the write. Closes the
+  time-of-check/time-of-use gap in the approval flow; SKILL.md Stage B now
+  always passes the hash.
+- **Test suite (new `tests/test_sync.py`, 17 cases):** marker anomalies,
+  empty/marker-containing content, dry-run purity, sha binding, CRLF byte
+  fidelity, non-UTF-8 refusal, symlink preservation, backup modes + retention,
+  init. CI runs it on a version×OS matrix (3.8/ubuntu-22.04, 3.12 + latest
+  /ubuntu, latest/macOS) with the interpreter under test.
+- Backup hardening: backup dir `0700`, every backup `0600` (CLAUDE.md can hold
+  sensitive operational context; backups no longer inherit default umask).
+- Drift-hook log capped at 128 KB (truncate-on-start) — a persistent error can
+  no longer grow `skillsmith-drift.log` without bound.
+- Cadence file is read strictly: a corrupted value now warns loudly and
+  disables nudges instead of being digit-squeezed into a different number
+  (`"14garbage30"` is not a cadence of 1430).
+
 ## v1.0.1 — 2026-07-18
 
 Fast-follow hardening from a post-release dual-reviewer CAP (Codex gpt-5.5 + an

@@ -5,7 +5,11 @@
 # --mark-synced: update the stamp manually. --set-cadence N: nudge every N days.
 # Always exits 0 — never blocks a session. Internal errors go to a local log.
 
-exec 2>>"$HOME/.claude/skillsmith-drift.log"
+# Cap the error log before appending — this hook runs every SessionStart, so a
+# persistent error would otherwise grow it without bound.
+LOG="$HOME/.claude/skillsmith-drift.log"
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 131072 ] && : > "$LOG"
+exec 2>>"$LOG"
 
 # Publish the bin dir of the copy that actually executes (manual ~/.claude/bin
 # or plugin cache) so SKILL.md resolves the helpers without guessing install
@@ -32,7 +36,7 @@ if [ "${1:-}" = "--set-cadence" ] && [ -n "${2:-}" ]; then
   if [ "$2" -eq 0 ]; then echo "cadence set: never (nudges off)"; else echo "cadence set: every $2 days"; fi
   exit 0
 fi
-if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.0.1"; exit 0; fi
+if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.0.2"; exit 0; fi
 
 # Backstop GC: delete stale mining-corpus corpses (the concentrated 14-day
 # aggregate) if a Stage C run was abandoned before its own cleanup ran.
@@ -50,7 +54,14 @@ mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 
 # Cadence nudge: skillsmith itself is overdue (opt-in via --set-cadence)
 if [ -f "$CADENCE_FILE" ]; then
-  CADENCE=$(tr -dc '0-9' < "$CADENCE_FILE")
+  # Strict read: a corrupted file must fail loud, not be digit-squeezed into a
+  # different number ("14garbage30" is not a cadence of 1430).
+  CADENCE=$(head -n1 "$CADENCE_FILE" | tr -d '[:space:]')
+  case "$CADENCE" in
+    ''|*[!0-9]*)
+      echo "⚠️ skillsmith: cadence file is corrupt ('${CADENCE}') — re-run --set-cadence to fix; nudges are off until then."
+      CADENCE="" ;;
+  esac
   if [ -n "$CADENCE" ] && [ "$CADENCE" -gt 0 ]; then
     AGE_DAYS=$(( ( $(date +%s) - $(mtime_of "$STAMP") ) / 86400 ))
     [ "$AGE_DAYS" -ge "$CADENCE" ] && \

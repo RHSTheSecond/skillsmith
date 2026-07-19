@@ -23,6 +23,7 @@ Exit codes:
 """
 import argparse
 import difflib
+import hashlib
 import os
 import shutil
 import sys
@@ -30,7 +31,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 BEGIN = "<!-- skillsmith:index:begin -->"
 END = "<!-- skillsmith:index:end -->"
@@ -47,8 +48,11 @@ def fail(code, msg):
 def read_md(path):
     # newline="" preserves the file's line endings verbatim (no universal-newline
     # normalization), so a CRLF CLAUDE.md is never silently rewritten to LF and
-    # verification is a true byte round-trip.
-    return path.read_text(encoding="utf-8", newline="")
+    # verification is a true byte round-trip. open() rather than Path.read_text():
+    # read_text() only grew a newline= parameter in Python 3.13, and this must
+    # run on 3.8+.
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return f.read()
 
 
 def backup_dir_for(md_path):
@@ -60,8 +64,12 @@ def backup_dir_for(md_path):
 def make_backup(md_path):
     bdir = backup_dir_for(md_path)
     bdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(bdir, 0o700)
     backup = bdir / f"{md_path.name}.{datetime.now():%Y%m%d-%H%M%S%f}"
     shutil.copy2(md_path, backup)
+    # CLAUDE.md can hold sensitive operational context — backups never inherit
+    # a looser mode than the diff overflow files get.
+    os.chmod(backup, 0o600)
     for old in sorted(bdir.glob(f"{md_path.name}.*"), reverse=True)[BACKUP_KEEP:]:
         old.unlink(missing_ok=True)
     return backup
@@ -96,6 +104,7 @@ def show_diff(original, updated, will_write):
         # world-readable /tmp (it can contain the user's whole CLAUDE.md).
         bdir = Path.home() / ".claude" / "backups"
         bdir.mkdir(parents=True, exist_ok=True)
+        os.chmod(bdir, 0o700)
         dfile = bdir / f"skillsmith-diff-{datetime.now():%Y%m%d-%H%M%S%f}.diff"
         dfile.write_text("\n".join(diff), encoding="utf-8")
         os.chmod(dfile, 0o600)
@@ -136,7 +145,9 @@ def run(args):
             atomic_write(md_path, updated)
         else:
             md_path.parent.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(updated, encoding="utf-8", newline="")
+            # open() not Path.write_text(): write_text() only grew newline= in 3.10
+            with open(md_path, "w", encoding="utf-8", newline="") as f:
+                f.write(updated)
         if md_path == DEFAULT_MD:
             STAMP.touch()  # establish the drift baseline immediately
         print(f"OK: empty marker pair added to {md_path}"
@@ -149,13 +160,19 @@ def run(args):
     if not md_path.is_file():
         fail(3, f"CLAUDE.md not found: {md_path} (use --init to create) — nothing modified")
 
-    new_block = content_file.read_text(encoding="utf-8", newline="").strip("\n")
+    new_block = read_md(content_file).strip("\n")
     if BEGIN in new_block or END in new_block:
         fail(3, "content file must NOT contain the markers themselves — CLAUDE.md untouched")
     if not new_block.strip() and not args.allow_empty:
         fail(3, "content file is empty — refusing to wipe the block (--allow-empty to override); CLAUDE.md untouched")
 
     original = read_md(md_path)
+    source_sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    if will_write and args.expected_sha256:
+        if args.expected_sha256.lower() != source_sha:
+            fail(3, f"CLAUDE.md changed since the reviewed dry run "
+                    f"(expected {args.expected_sha256[:12]}…, found {source_sha[:12]}…) "
+                    f"— nothing written; re-run the dry run and re-approve.")
     n_begin, n_end = original.count(BEGIN), original.count(END)
     if (n_begin, n_end) != (1, 1):
         fail(1, f"marker anomaly: {n_begin}x begin / {n_end}x end (need exactly 1 each) "
@@ -173,7 +190,13 @@ def run(args):
         return
 
     show_diff(original, updated, will_write)
-    if finish_dry(will_write):
+    if not will_write:
+        # Bind the approved diff to the exact bytes it was computed from: apply
+        # with this hash and a concurrent edit between review and write refuses
+        # instead of splicing into a file nobody approved.
+        print(f"source sha256: {source_sha}")
+        print("dry-run: no write performed "
+              f"(to write exactly this: --apply --expected-sha256 {source_sha})")
         return
 
     backup = make_backup(md_path)
@@ -196,6 +219,9 @@ def main():
     p.add_argument("--apply", action="store_true", help="actually write (default is dry-run)")
     p.add_argument("--dry-run", action="store_true", help="explicit no-op alias (default behavior)")
     p.add_argument("--allow-empty", action="store_true")
+    p.add_argument("--expected-sha256", metavar="HASH",
+                   help="refuse to write unless CLAUDE.md still hashes to HASH "
+                        "(printed by the dry run) — pins the approved state")
     p.add_argument("--init", action="store_true", help="append an empty marker pair (first-run setup)")
     p.add_argument("--version", action="version", version=f"skillsmith-sync {__version__}")
     args = p.parse_args()

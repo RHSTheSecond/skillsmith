@@ -41,6 +41,7 @@ Skillsmith's honesty rests on being clear about which guarantees are enforced by
 | Property | Enforced by |
 |---|---|
 | No unapproved CLAUDE.md write | **code** — `skillsmith-sync` dry-runs unless `--apply` |
+| Approved diff = applied diff | **code** — `--apply --expected-sha256` pins the bytes the reviewed diff was computed from; concurrent edits refuse |
 | Marker validation / refuse-on-anomaly | **code** — `skillsmith-sync` |
 | Backups + atomic + byte-verified writes | **code** — `skillsmith-sync` |
 | Drift detection at session start | **code** — `skillsmith-drift-check` hook |
@@ -129,7 +130,7 @@ Drop a `LOCAL.md` next to the installed SKILL.md — or, for plugin installs, at
 ## Requirements
 
 - Claude Code with skills support (`~/.claude/skills/`)
-- `python3` ≥ 3.8 (the sync + extract scripts)
+- `python3` ≥ 3.8 (the sync + extract scripts; CI runs the test suite on 3.8, 3.12, and latest, Linux + macOS)
 - macOS or Linux
 
 ## Honest limits
