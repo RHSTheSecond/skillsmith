@@ -61,7 +61,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.read(self.md), before)
 
     def test_apply_splices_and_byte_verifies(self):
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("byte-verified", r.stdout)
         got = self.read(self.md)
@@ -71,12 +71,26 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(got.endswith("bottom\n"))
 
     def test_idempotent_noop(self):
-        self.sync("--apply")
-        r = self.sync("--apply")
+        self.sync("--apply", "--no-pin")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("no-op", r.stdout)
 
     # -- sha256 binding (approved diff = applied diff) -------------------------
+
+    def test_apply_without_pin_or_optout_refuses(self):
+        """CAP finding: --expected-sha256 was optional, so the README's
+        'approved diff = applied diff — code' row was really enforced by prose."""
+        before = self.read(self.md)
+        r = self.sync("--apply")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("--expected-sha256", r.stderr)
+        self.assertEqual(self.read(self.md), before)
+
+    def test_marker_anomaly_outranks_the_pin_gate(self):
+        self.write(self.md, "no markers here\n")
+        r = self.sync("--apply")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
 
     def test_expected_sha_matches(self):
         m = re.search(r"source sha256: ([0-9a-f]{64})", self.sync().stdout)
@@ -95,7 +109,7 @@ class SyncTest(unittest.TestCase):
 
     def _assert_refuses(self, md_text, code=1):
         self.write(self.md, md_text)
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, code, r.stderr)
         self.assertEqual(self.read(self.md), md_text)
 
@@ -113,25 +127,25 @@ class SyncTest(unittest.TestCase):
     def test_empty_content_refused_without_allow_empty(self):
         self.write(self.content, "\n")
         before = self.read(self.md)
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 3)
         self.assertEqual(self.read(self.md), before)
-        self.assertEqual(self.sync("--apply", "--allow-empty").returncode, 0)
+        self.assertEqual(self.sync("--apply", "--no-pin", "--allow-empty").returncode, 0)
 
     def test_content_containing_markers_refused(self):
         self.write(self.content, BEGIN + "\n")
-        self.assertEqual(self.sync("--apply").returncode, 3)
+        self.assertEqual(self.sync("--apply", "--no-pin").returncode, 3)
 
     def test_missing_content_file(self):
         self.content.unlink()
-        self.assertEqual(self.sync("--apply").returncode, 3)
+        self.assertEqual(self.sync("--apply", "--no-pin").returncode, 3)
 
     # -- byte fidelity ---------------------------------------------------------
 
     def test_crlf_outside_block_preserved(self):
         original = "top\r\nmore\r\n%s\r\nold\r\n%s\r\ntail\r\n" % (BEGIN, END)
         self.write(self.md, original)
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 0, r.stderr)
         got = self.read(self.md)
         i, j = original.index(BEGIN), original.index(END)
@@ -142,7 +156,7 @@ class SyncTest(unittest.TestCase):
         raw = b"\xff\xfe garbage " + BEGIN.encode() + b"\n" + END.encode() + b"\n"
         with open(str(self.md), "wb") as f:
             f.write(raw)
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 3)
         with open(str(self.md), "rb") as f:
             self.assertEqual(f.read(), raw)
@@ -153,13 +167,13 @@ class SyncTest(unittest.TestCase):
         target = self.dir / "real.md"
         os.replace(str(self.md), str(target))
         self.md.symlink_to(target)
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(self.md.is_symlink())
         self.assertIn("| a | b |", self.read(target))
 
     def test_backup_created_with_private_modes(self):
-        r = self.sync("--apply")
+        r = self.sync("--apply", "--no-pin")
         self.assertEqual(r.returncode, 0, r.stderr)
         bdir = self.dir / ".skillsmith-backups"
         backups = list(bdir.glob("CLAUDE.md.*"))
@@ -171,7 +185,7 @@ class SyncTest(unittest.TestCase):
     def test_backup_retention_capped_at_20(self):
         for i in range(22):
             self.write(self.content, "row %d\n" % i)
-            self.assertEqual(self.sync("--apply").returncode, 0)
+            self.assertEqual(self.sync("--apply", "--no-pin").returncode, 0)
         backups = list((self.dir / ".skillsmith-backups").glob("CLAUDE.md.*"))
         self.assertLessEqual(len(backups), 20)
 

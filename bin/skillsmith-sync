@@ -31,12 +31,16 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 BEGIN = "<!-- skillsmith:index:begin -->"
 END = "<!-- skillsmith:index:end -->"
-DEFAULT_MD = Path.home() / ".claude" / "CLAUDE.md"
-STAMP = Path.home() / ".claude" / ".skillsmith-last-sync"
+# Claude Code relocates its config tree when CLAUDE_CONFIG_DIR is set. Writing to
+# a hardcoded ~/.claude there would splice an alias block into a CLAUDE.md the
+# harness never loads — byte-verified, backed up, and completely ineffective.
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+DEFAULT_MD = CONFIG / "CLAUDE.md"
+STAMP = CONFIG / ".skillsmith-last-sync"
 BACKUP_KEEP = 20
 
 
@@ -57,7 +61,7 @@ def read_md(path):
 
 def backup_dir_for(md_path):
     if md_path == DEFAULT_MD:
-        return Path.home() / ".claude" / "backups"
+        return CONFIG / "backups"
     return md_path.parent / ".skillsmith-backups"
 
 
@@ -71,6 +75,10 @@ def make_backup(md_path):
     # a looser mode than the diff overflow files get.
     os.chmod(backup, 0o600)
     for old in sorted(bdir.glob(f"{md_path.name}.*"), reverse=True)[BACKUP_KEEP:]:
+        old.unlink(missing_ok=True)
+    # Overflow diffs can hold the whole file too, and nothing pruned them: the
+    # backup retention glob only ever matched "CLAUDE.md.*".
+    for old in sorted(bdir.glob("skillsmith-diff-*.diff"), reverse=True)[BACKUP_KEEP:]:
         old.unlink(missing_ok=True)
     return backup
 
@@ -102,7 +110,7 @@ def show_diff(original, updated, will_write):
     if len(diff) > 120:
         # Overflow diff goes to a 0600 file under the backup dir — never
         # world-readable /tmp (it can contain the user's whole CLAUDE.md).
-        bdir = Path.home() / ".claude" / "backups"
+        bdir = CONFIG / "backups"
         bdir.mkdir(parents=True, exist_ok=True)
         os.chmod(bdir, 0o700)
         dfile = bdir / f"skillsmith-diff-{datetime.now():%Y%m%d-%H%M%S%f}.diff"
@@ -168,11 +176,6 @@ def run(args):
 
     original = read_md(md_path)
     source_sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
-    if will_write and args.expected_sha256:
-        if args.expected_sha256.lower() != source_sha:
-            fail(3, f"CLAUDE.md changed since the reviewed dry run "
-                    f"(expected {args.expected_sha256[:12]}…, found {source_sha[:12]}…) "
-                    f"— nothing written; re-run the dry run and re-approve.")
     n_begin, n_end = original.count(BEGIN), original.count(END)
     if (n_begin, n_end) != (1, 1):
         fail(1, f"marker anomaly: {n_begin}x begin / {n_end}x end (need exactly 1 each) "
@@ -180,6 +183,16 @@ def run(args):
     i, j = original.index(BEGIN), original.index(END)
     if i > j:
         fail(1, "marker anomaly: begin appears after end — refusing to write.")
+
+    if will_write and not args.expected_sha256 and not args.no_pin:
+        fail(3, "--apply requires --expected-sha256 <hash from the dry run> so the "
+                "bytes you approved are the bytes that get written (pass --no-pin to "
+                "write without that binding) — CLAUDE.md untouched.")
+    if will_write and args.expected_sha256:
+        if args.expected_sha256.lower() != source_sha:
+            fail(3, f"CLAUDE.md changed since the reviewed dry run "
+                    f"(expected {args.expected_sha256[:12]}…, found {source_sha[:12]}…) "
+                    f"— nothing written; re-run the dry run and re-approve.")
 
     updated = original[: i + len(BEGIN)] + "\n" + new_block + "\n" + original[j:]
 
@@ -222,6 +235,10 @@ def main():
     p.add_argument("--expected-sha256", metavar="HASH",
                    help="refuse to write unless CLAUDE.md still hashes to HASH "
                         "(printed by the dry run) — pins the approved state")
+    p.add_argument("--no-pin", action="store_true",
+                   help="allow --apply without --expected-sha256: writes without "
+                        "binding to the reviewed bytes. Explicit, so a dropped flag "
+                        "cannot silently splice into an unreviewed file.")
     p.add_argument("--init", action="store_true", help="append an empty marker pair (first-run setup)")
     p.add_argument("--version", action="version", version=f"skillsmith-sync {__version__}")
     args = p.parse_args()
@@ -234,6 +251,8 @@ def main():
         run(args)
     except SystemExit:
         raise
+    except KeyboardInterrupt:
+        fail(3, "interrupted — CLAUDE.md untouched unless a backup path was printed above")
     except BaseException as e:
         fail(3, f"internal error: {type(e).__name__}: {e} — CLAUDE.md untouched unless a backup path was printed above")
 

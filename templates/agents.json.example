@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Example agent registry. The live one lives at ~/.claude/skillsmith/agents.json;",
+    "create it with `skillsmith-agents --init` and append rows with `--add` (which",
+    "validates the row) rather than hand-editing. Keys starting with _ are ignored.",
+    "",
+    "signal.type  file    -> healthy if the file was written within max_age_hours,",
+    "                       dead if it is older, unmeasurable if it cannot be read",
+    "             command -> an ARGV LIST (no shell); runs only with --allow-exec;",
+    "                        exit 0 healthy, nonzero dead",
+    "signal.class delivered | acknowledged | acted_on — what the signal ACTUALLY",
+    "             measures. 'delivered' is not evidence anyone read it."
+  ],
+  "version": 1,
+  "agents": [
+    {
+      "name": "nightly-digest",
+      "unit": "nightly-digest.timer",
+      "owner": "you@example.com",
+      "trigger": "systemd timer, daily 06:05",
+      "side_effect_class": "posts a card to a team chat space (undeletable by the agent)",
+      "output_surface": "the #reports chat space",
+      "signal": {
+        "type": "file",
+        "path": "~/logs/nightly-digest.log",
+        "max_age_hours": 26,
+        "class": "delivered"
+      },
+      "approved_on": "2026-09-07",
+      "approved_by": "you@example.com",
+      "review_by": "2026-12-07"
+    },
+    {
+      "name": "backup-watch",
+      "unit": "backup-watch.timer",
+      "owner": "you@example.com",
+      "trigger": "systemd timer, daily 08:15",
+      "side_effect_class": "alerts an on-call channel; no writes to any system of record",
+      "output_surface": "the alerts channel",
+      "signal": {
+        "type": "command",
+        "command": ["systemctl", "is-active", "backup-watch.timer"],
+        "class": "delivered"
+      },
+      "approved_on": "2026-09-07",
+      "approved_by": "you@example.com",
+      "review_by": "2027-03-07"
+    }
+  ]
+}

@@ -46,13 +46,27 @@ jobs:
           PLUGIN_V=$(jq -re '.version' .claude-plugin/plugin.json)
           jq -e '.plugins[0] | has("version") | not' .claude-plugin/marketplace.json >/dev/null \
             || { echo "marketplace entry must not declare a version (plugin.json wins)"; exit 1; }
-          for s in bin/skillsmith-sync bin/skillsmith-extract bin/skillsmith-drift-check; do
-            grep -q "$PLUGIN_V" "$s" || { echo "$s version string != $PLUGIN_V"; exit 1; }
+          # Exact equality on what the script REPORTS, not a substring grep: a
+          # grep passes on a changelog comment while --version still prints 1.0.2.
+          for s in bin/skillsmith-sync bin/skillsmith-extract bin/skillsmith-drift-check bin/skillsmith-agents; do
+            GOT=$("$s" --version | awk '{print $NF}')
+            [ "$GOT" = "$PLUGIN_V" ] || { echo "$s --version says $GOT, plugin.json says $PLUGIN_V"; exit 1; }
           done
           # the skill body must resolve scripts via $SMITH_BIN, never hardcoded paths
           if grep -n '~/.claude/bin/skillsmith-' skills/skillsmith/SKILL.md; then
             echo "SKILL.md contains hardcoded ~/.claude/bin/skillsmith-* paths"; exit 1
           fi
+
+      - name: Hook is actually shipped and wired
+        run: |
+          set -euo pipefail
+          # The pointer file alone proves nothing (any invocation writes it) —
+          # assert the manifest the plugin loader reads.
+          jq -e '.hooks.SessionStart[0].hooks[0].command | test("skillsmith-drift-check")' \
+            hooks/hooks.json >/dev/null
+          jq -e '.hooks.SessionStart[0].hooks[0].command | test("CLAUDE_PLUGIN_ROOT")' \
+            hooks/hooks.json >/dev/null
+          test -f LICENSE
 
       - name: Smoke install (isolated config dir)
         run: |
@@ -67,5 +81,25 @@ jobs:
           "$BIN/skillsmith-sync" --version
           "$BIN/skillsmith-extract" --version
           "$BIN/skillsmith-drift-check" --version
-          # the drift hook must have published the bin pointer to the cache copy
-          grep -q "plugins/cache/skillsmith/skillsmith" "$HOME/.claude/.skillsmith-bin"
+          "$BIN/skillsmith-agents" --version
+          # --version must NOT write the pointer (that side effect made this
+          # assertion vacuous); a real hook-shaped invocation must.
+          test ! -f "$CLAUDE_CONFIG_DIR/.skillsmith-bin"
+          "$BIN/skillsmith-drift-check"
+          grep -q "plugins/cache/skillsmith/skillsmith" "$CLAUDE_CONFIG_DIR/.skillsmith-bin"
+          # the installed plugin must carry the hook manifest, not just the scripts
+          jq -e '.hooks.SessionStart' "$(dirname "$BIN")/hooks/hooks.json" >/dev/null
+
+      - name: Respects CLAUDE_CONFIG_DIR (writes must land in the relocated tree)
+        run: |
+          set -euo pipefail
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/relocated"
+          mkdir -p "$CLAUDE_CONFIG_DIR"
+          printf 'x | y |\n' > "$RUNNER_TEMP/block.txt"
+          bin/skillsmith-sync --init --apply
+          test -f "$CLAUDE_CONFIG_DIR/CLAUDE.md"
+          test ! -f "$HOME/.claude/CLAUDE.md"
+          bin/skillsmith-sync "$RUNNER_TEMP/block.txt" --apply --no-pin
+          grep -q "x | y |" "$CLAUDE_CONFIG_DIR/CLAUDE.md"
+          bin/skillsmith-agents --init
+          test -f "$CLAUDE_CONFIG_DIR/skillsmith/agents.json"

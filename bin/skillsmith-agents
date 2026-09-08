@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""skillsmith-agents — the agent registry: a durable record of every promotion to
+the top rung of the ladder, and the only thing code can do about unapproved ones.
+
+Why a registry exists: session transcripts cannot see a scheduled agent running on
+some other machine. An agent-tier audit driven by transcripts has no data source,
+so the audit is driven by this file instead — one row per promoted agent, written
+at the promotion ceremony, carrying the health signal the audit later evaluates.
+
+  ~/.claude/skillsmith/agents.json
+  {"version": 1, "agents": [ {row}, ... ]}
+
+Row schema (all required unless marked):
+  name              stable identifier ("nightly-digest")
+  unit              optional: the scheduler's own name for it ("foo.timer")
+  owner             the human accountable for it
+  trigger           what fires it ("systemd timer, daily 06:05")
+  side_effect_class what it can do that is hard to undo ("posts to a chat space")
+  output_surface    where its output lands, in words
+  signal            {"type": "file"|"command", ..., "class": delivered|
+                    acknowledged|acted_on} — see below
+  approved_on       ISO date the human approved the promotion
+  approved_by       who approved it
+  review_by         ISO date this promotion must be re-justified
+
+Signals — evidence classes, because "it ran" is the weakest possible proof:
+  delivered     the output reached its surface (a file was written, a post 200'd)
+  acknowledged  a human saw it
+  acted_on      a human did something because of it
+Each agent declares which class its signal actually measures. An audit never
+upgrades a delivered signal into evidence of usefulness.
+
+  {"type": "file", "path": "~/x.log", "max_age_hours": 26, "class": "delivered"}
+  {"type": "command", "command": ["systemctl", "is-active", "x"], "class": "delivered"}
+
+A command signal is an ARGV LIST, never a shell string: there is no shell, so no
+pipeline, redirect, or `$(...)` can hide in a registry someone else can write. It
+still runs a program as you, which is why it also needs --allow-exec and why the
+command is printed before it runs. Anyone who can write your registry can choose
+that program; treat the file as you would your shell profile.
+
+Verdicts are three, never two:
+  healthy       signal readable and fresh / command succeeded
+  dead          signal readable and stale / command failed
+  unmeasurable  signal could not be read at all — LOUD, never quietly "healthy",
+                never guessed into "dead" (a missing file cannot tell you whether
+                the agent is broken or the path is wrong)
+
+Command signals execute shell commands from a config file, so they run ONLY with
+an explicit --allow-exec; without it they report unmeasurable with that reason.
+
+Usage:
+  skillsmith-agents --audit [--registry PATH] [--running-from FILE] [--allow-exec] [--json]
+  skillsmith-agents --init [--registry PATH]
+  skillsmith-agents --add --name N --owner O --trigger T --side-effect-class C \\
+                    --output-surface S --signal-type file --signal-path P \\
+                    --max-age-hours H --signal-class delivered \\
+                    --approved-by WHO --review-by YYYY-MM-DD [--unit U]
+  skillsmith-agents --version
+
+Exit codes: 0 ok · 3 usage / unreadable or malformed registry (nothing written)
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, date
+from pathlib import Path
+
+__version__ = "1.1.0"
+
+# Claude Code relocates its config tree when CLAUDE_CONFIG_DIR is set; a hardcoded
+# ~/.claude would keep a second, invisible registry on such a machine.
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+DEFAULT_REGISTRY = CONFIG / "skillsmith" / "agents.json"
+REGISTRY_VERSION = 1
+SIGNAL_CLASSES = ("delivered", "acknowledged", "acted_on")
+REQUIRED = ("name", "owner", "trigger", "side_effect_class", "output_surface",
+            "signal", "approved_on", "approved_by", "review_by")
+UNIT_RE = re.compile(r"[\w@.-]+\.(?:timer|service)")
+NAME_RE = re.compile(r"^(?=[^\s]*[A-Za-z])[A-Za-z0-9][\w@.:-]*$")
+# Distribution-shipped timers are not promotions anyone made. Flagging a dozen of
+# them on the first run is how a real finding gets lost and the check gets dropped.
+VENDOR_PREFIXES = ("apt-", "dpkg-", "man-db", "logrotate", "fstrim", "e2scrub",
+                   "motd-news", "systemd-", "snapd", "unattended-upgrades",
+                   "update-notifier", "ua-", "anacron", "phpsessionclean",
+                   "com.apple.")
+CMD_TIMEOUT = 15
+
+
+def _marks():
+    """Emoji where the terminal can render them, ASCII where it cannot: under
+    LC_ALL=C (cron, systemd units, minimal containers) a bare print of an emoji
+    raises UnicodeEncodeError and takes the whole audit with it."""
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    if "utf" in enc:
+        return {"healthy": "✅", "dead": "❌", "unmeasurable": "❓",
+                "rogue": "🚨", "review": "⏳"}
+    return {"healthy": "[ok]", "dead": "[dead]", "unmeasurable": "[?]",
+            "rogue": "[!]", "review": "[due]"}
+
+
+MARK = _marks()
+
+
+def fail(msg):
+    print(f"skillsmith-agents: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+
+def load(path):
+    if not path.is_file():
+        fail(f"no registry at {path} — run --init to create one "
+             f"(an empty registry is a valid answer; a missing one is not)")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        fail(f"unreadable/malformed registry {path}: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("agents"), list):
+        fail(f"malformed registry {path}: expected an object with an 'agents' list")
+    if data.get("version") != REGISTRY_VERSION:
+        fail(f"registry version {data.get('version')} != {REGISTRY_VERSION}")
+    return data
+
+
+def save(path, data):
+    """Unique temp file + atomic replace. Two concurrent --add runs sharing one
+    fixed '.tmp' path could interleave into a corrupt file; mkstemp cannot."""
+    existed = path.parent.is_dir()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Only tighten a directory THIS tool created, and only inside the config dir.
+    # `--registry /tmp/agents.json` must never chmod /tmp to 0700.
+    under_config = (path.parent == CONFIG / "skillsmith"
+                    or CONFIG in path.parent.parents)
+    if not existed and under_config:
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class registry_lock(object):
+    """Serialize read-modify-write on the registry: without it, two promotion
+    ceremonies that overlap both read the old file and the second silently drops
+    the first one's row."""
+
+    def __init__(self, path):
+        self.lockpath = str(path) + ".lock"
+        self.fh = None
+
+    def __enter__(self):
+        Path(self.lockpath).parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.lockpath, "a+")
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            pass          # a filesystem without locking is not a reason to refuse
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self.fh.close()
+        return False
+
+
+def row_problems(row):
+    """Schema violations. An invalid row is a FINDING, never a silent skip —
+    the failure mode this file exists to prevent is an agent nobody can see."""
+    problems = []
+    if not isinstance(row, dict):
+        return ["row is not an object"]
+    for field in REQUIRED:
+        if not row.get(field):
+            problems.append(f"missing {field}")
+    sig = row.get("signal")
+    if not isinstance(sig, dict):
+        problems.append("signal must be an object")
+    else:
+        if sig.get("type") not in ("file", "command"):
+            problems.append(f"unknown signal type {sig.get('type')!r}")
+        if sig.get("class") not in SIGNAL_CLASSES:
+            problems.append(f"signal class must be one of {'/'.join(SIGNAL_CLASSES)}")
+        if sig.get("type") == "file":
+            if not sig.get("path"):
+                problems.append("file signal needs a path")
+            if sig.get("max_age_hours") is None:
+                problems.append("file signal needs max_age_hours — without a "
+                                "freshness bound the row can never be measured")
+        if sig.get("type") == "command":
+            cmd = sig.get("command")
+            if not cmd:
+                problems.append("command signal needs a command")
+            elif not (isinstance(cmd, list) and cmd
+                      and all(isinstance(a, str) for a in cmd)):
+                problems.append("command must be an argv LIST of strings "
+                                "(no shell string — there is no shell)")
+        if sig.get("type") == "file" and sig.get("max_age_hours") is not None:
+            try:
+                if float(sig["max_age_hours"]) <= 0:
+                    problems.append("max_age_hours must be greater than 0 "
+                                    "(a non-positive freshness limit can never pass)")
+            except (TypeError, ValueError):
+                problems.append("max_age_hours must be a number")
+    return problems
+
+
+def evaluate(row, allow_exec):
+    """(verdict, detail) — healthy / dead / unmeasurable."""
+    sig = row.get("signal") or {}
+    kind = sig.get("type")
+    max_age = sig.get("max_age_hours")
+
+    if kind == "file":
+        path = Path(os.path.expanduser(str(sig.get("path", "")))) if sig.get("path") else None
+        if path is None:
+            return "unmeasurable", "no path on the signal"
+        try:
+            age_h = (time.time() - path.stat().st_mtime) / 3600.0
+        except OSError as e:
+            return "unmeasurable", f"cannot read {path}: {e.__class__.__name__}"
+        if max_age is None:
+            return "unmeasurable", "file signal has no max_age_hours — freshness undefined"
+        if age_h <= float(max_age):
+            return "healthy", f"{path.name} written {age_h:.1f}h ago (limit {max_age}h)"
+        return "dead", f"{path.name} last written {age_h:.1f}h ago (limit {max_age}h)"
+
+    if kind == "command":
+        argv = sig.get("command")
+        shown = " ".join(argv) if isinstance(argv, list) else str(argv)
+        if not allow_exec:
+            return "unmeasurable", f"not evaluated (pass --allow-exec to run `{shown}`)"
+        print(f"  … running signal command: {shown}", file=sys.stderr)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=CMD_TIMEOUT)
+        except (subprocess.SubprocessError, OSError) as e:
+            return "unmeasurable", f"signal command could not run: {e.__class__.__name__}"
+        if proc.returncode == 0:
+            return "healthy", f"`{shown}` exited 0"
+        why = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return "dead", (f"`{shown}` exited {proc.returncode}"
+                        + (f": {why[0][:120]}" if why else ""))
+
+    return "unmeasurable", f"unknown signal type {kind!r}"
+
+
+def review_overdue(row):
+    try:
+        due = datetime.strptime(str(row.get("review_by")), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return "review_by is not an ISO date"
+    if due < date.today():
+        return f"review overdue since {due.isoformat()}"
+    return None
+
+
+def running_names(path, fmt, ignore_vendor=True):
+    """(names, notes) — what the scheduler says is running.
+
+    The format is DECLARED, never sniffed. Sniffing was worse than useless here:
+    on a crontab it turned `5 6 * * * …` into an agent named "5", and on a mixed
+    listing one systemd line made every cron line vanish silently. `systemd`
+    reads unit names (collapsing foo.timer/foo.service to one agent); `names`
+    reads one identifier per line and refuses lines that are not identifiers.
+    Either way, every line this function did not understand is reported."""
+    notes = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh]
+    except OSError as e:
+        return None, [f"cannot read --running-from {path}: {e.__class__.__name__} "
+                      f"— the unapproved-promotion check did NOT run"]
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+
+    names, unparsed = set(), 0
+    if fmt == "systemd":
+        for line in lines:
+            found = UNIT_RE.findall(line)
+            if found:
+                names.update(re.sub(r"\.(timer|service)$", "", u) for u in found)
+            else:
+                unparsed += 1
+    else:
+        for line in lines:
+            # one name per line: a multi-token line is a command or a table row,
+            # not an agent name, and split()[0] on one invents agents like "5"
+            token = line.split()
+            if len(token) == 1 and NAME_RE.match(token[0]):
+                names.add(re.sub(r"\.(timer|service)$", "", token[0]))
+            else:
+                unparsed += 1
+    if unparsed:
+        notes.append(f"{unparsed} line(s) in {path} were not understood as "
+                     f"--running-from-format={fmt} and were skipped — those jobs "
+                     f"were NOT checked against the registry")
+
+    vendor = sorted(n for n in names
+                    if ignore_vendor and any(n.startswith(p) for p in VENDOR_PREFIXES))
+    if vendor:
+        names -= set(vendor)
+        notes.append(f"{len(vendor)} distribution unit(s) ignored as vendor-owned "
+                     f"({', '.join(vendor[:4])}{'…' if len(vendor) > 4 else ''}) "
+                     f"— pass --no-vendor-ignore to include them")
+    return sorted(names), notes
+
+
+def registered_aliases(agents):
+    alias = set()
+    for row in agents:
+        for key in ("name", "unit"):
+            val = row.get(key)
+            if val:
+                alias.add(val)
+                alias.add(re.sub(r"\.(timer|service)$", "", val))
+    return alias
+
+
+def audit(args):
+    path = Path(args.registry).expanduser() if args.registry else DEFAULT_REGISTRY
+    data = load(path)
+    agents = data["agents"]
+
+    results, findings = [], []
+    for row in agents:
+        problems = row_problems(row)
+        name = (row.get("name") if isinstance(row, dict) else None) or "<unnamed row>"
+        if problems:
+            results.append({"name": name, "verdict": "unmeasurable",
+                            "signal_class": None,
+                            "detail": "invalid registry row: " + "; ".join(problems)})
+            findings.append(f"{name}: invalid registry row ({'; '.join(problems)})")
+            continue
+        try:
+            verdict, detail = evaluate(row, args.allow_exec)
+        except Exception as e:                      # noqa: BLE001 - deliberate
+            verdict = "unmeasurable"
+            detail = f"signal evaluation raised {type(e).__name__}: {e}"
+        entry = {"name": name, "verdict": verdict,
+                 "signal_class": row["signal"].get("class"), "detail": detail}
+        overdue = review_overdue(row)
+        if overdue:
+            entry["review"] = overdue
+            findings.append(f"{name}: {overdue}")
+        if verdict != "healthy":
+            findings.append(f"{name}: {verdict} — {detail}")
+        results.append(entry)
+
+    unregistered, notes = [], []
+    if args.running_from:
+        alias = registered_aliases([r for r in agents if isinstance(r, dict)])
+        found, notes = running_names(Path(args.running_from).expanduser(),
+                                     args.running_from_format,
+                                     ignore_vendor=not args.no_vendor_ignore)
+        if found is None:
+            # A bad path costs the unapproved-promotion check, never the verdicts
+            # the user actually came for.
+            findings.extend(notes)
+        else:
+            for unit in found:
+                bare = re.sub(r"\.(timer|service)$", "", unit)
+                if unit not in alias and bare not in alias:
+                    unregistered.append(unit)
+                    findings.append(f"{unit}: running but NOT in the registry — "
+                                    f"an unapproved promotion")
+
+    if args.json:
+        print(json.dumps({"registry": str(path), "agents": results,
+                          "unregistered": unregistered, "findings": findings,
+                          "notes": notes}, indent=2))
+        return
+
+    print(f"agent registry: {path}  ({len(agents)} row{'s' if len(agents) != 1 else ''})")
+    if not agents:
+        print("  (empty — nothing has been promoted to the agent rung)")
+    width = max([len(r["name"]) for r in results] or [4])
+    for r in results:
+        mark = MARK[r["verdict"]]
+        cls = f"[{r['signal_class']}]" if r.get("signal_class") else ""
+        print(f"  {mark} {r['name']:<{width}}  {r['verdict']:<12} {cls:<15} {r['detail']}")
+        if r.get("review"):
+            print(f"     {MARK['review']} {r['review']}")
+    for unit in unregistered:
+        print(f"  {MARK['rogue']} {unit}: running but NOT in the registry "
+              f"— an unapproved promotion")
+    for note in notes:
+        print(f"  · {note}")
+    print()
+    if findings:
+        print(f"{len(findings)} finding(s):")
+        for f in findings:
+            print(f"  - {f}")
+    else:
+        print("no findings.")
+    if any(r["verdict"] == "unmeasurable" for r in results):
+        print("\nNOTE: 'unmeasurable' is a verdict, not a pass. An agent whose signal "
+              "cannot be read is not known to be working.")
+
+
+def init(args):
+    path = Path(args.registry).expanduser() if args.registry else DEFAULT_REGISTRY
+    if path.is_file():
+        fail(f"registry already exists: {path}")
+    save(path, {"version": REGISTRY_VERSION, "agents": []})
+    print(f"OK: empty agent registry created at {path} (mode 600)")
+
+
+def add(args):
+    path = Path(args.registry).expanduser() if args.registry else DEFAULT_REGISTRY
+    with registry_lock(path):
+        _add_locked(args, path)
+
+
+def _add_locked(args, path):
+    data = load(path)
+    if any(isinstance(r, dict) and r.get("name") == args.name for r in data["agents"]):
+        fail(f"an agent named {args.name!r} is already registered")
+    signal = {"type": args.signal_type, "class": args.signal_class}
+    if args.signal_type == "file":
+        signal["path"] = args.signal_path
+        signal["max_age_hours"] = args.max_age_hours
+    else:
+        # argv, not a shell string: --signal-command is repeatable, one token each
+        signal["command"] = list(args.signal_command or [])
+    row = {"name": args.name, "owner": args.owner, "trigger": args.trigger,
+           "side_effect_class": args.side_effect_class,
+           "output_surface": args.output_surface, "signal": signal,
+           "approved_on": args.approved_on or date.today().isoformat(),
+           "approved_by": args.approved_by, "review_by": args.review_by}
+    if args.unit:
+        row["unit"] = args.unit
+    problems = row_problems(row)
+    if problems:
+        fail("refusing to register an invalid row: " + "; ".join(problems))
+    if review_overdue(row) == "review_by is not an ISO date":
+        fail("--review-by must be an ISO date (YYYY-MM-DD)")
+    data["agents"].append(row)
+    save(path, data)
+    print(f"OK: registered {args.name} in {path} · review by {args.review_by}")
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--registry", help=f"registry path (default: {DEFAULT_REGISTRY})")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--audit", action="store_true", help="evaluate every registered agent")
+    mode.add_argument("--init", action="store_true", help="create an empty registry")
+    mode.add_argument("--add", action="store_true", help="register a promoted agent")
+    p.add_argument("--running-from", metavar="FILE",
+                   help="file of running agents (e.g. `systemctl list-timers` output) — "
+                        "anything absent from the registry is flagged")
+    p.add_argument("--running-from-format", choices=("systemd", "names"),
+                   default="systemd",
+                   help="how to read --running-from: systemd unit listing (default) "
+                        "or one agent name per line. Declared, never guessed.")
+    p.add_argument("--no-vendor-ignore", action="store_true",
+                   help="also check distribution-shipped units (apt-daily, logrotate, "
+                        "systemd-*, com.apple.*), which are ignored by default")
+    p.add_argument("--allow-exec", action="store_true",
+                   help="permit command-type signals to execute (they are shell commands "
+                        "read from a config file; off by default)")
+    p.add_argument("--json", action="store_true", help="machine-readable audit output")
+    for flag in ("name", "unit", "owner", "trigger", "side-effect-class",
+                 "output-surface", "signal-path", "approved-by",
+                 "approved-on", "review-by"):
+        p.add_argument(f"--{flag}")
+    p.add_argument("--signal-command", action="append",
+                   help="one argv token per flag: --signal-command systemctl "
+                        "--signal-command is-active --signal-command foo.timer "
+                        "(there is no shell, so no pipelines or redirects)")
+    p.add_argument("--signal-type", choices=("file", "command"), default="file")
+    p.add_argument("--signal-class", choices=SIGNAL_CLASSES, default="delivered")
+    p.add_argument("--max-age-hours", type=float)
+    p.add_argument("--version", action="version", version=f"skillsmith-agents {__version__}")
+    args = p.parse_args()
+
+    if args.init:
+        init(args)
+    elif args.add:
+        add(args)
+    elif args.audit:
+        audit(args)
+    else:
+        p.print_usage(sys.stderr)
+        fail("pick a mode: --audit, --init, or --add")
+
+
+if __name__ == "__main__":
+    main()

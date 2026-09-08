@@ -7,7 +7,10 @@
 
 # Cap the error log before appending — this hook runs every SessionStart, so a
 # persistent error would otherwise grow it without bound.
-LOG="$HOME/.claude/skillsmith-drift.log"
+# Claude Code relocates its config tree when CLAUDE_CONFIG_DIR is set; watching
+# ~/.claude there would report drift for a skill library the harness never loads.
+CONFIG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+LOG="$CONFIG/skillsmith-drift.log"
 [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 131072 ] && : > "$LOG"
 exec 2>>"$LOG"
 
@@ -15,11 +18,13 @@ exec 2>>"$LOG"
 # or plugin cache) so SKILL.md resolves the helpers without guessing install
 # layout — the pointer is rewritten on every run, so it self-heals across
 # installs, updates, and mode switches.
-BIN_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) && \
-  printf '%s\n' "$BIN_DIR" > "$HOME/.claude/.skillsmith-bin"
+publish_bin_dir() {
+  BIN_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) && \
+    printf '%s\n' "$BIN_DIR" > "$CONFIG/.skillsmith-bin"
+}
 
-STAMP="$HOME/.claude/.skillsmith-last-sync"
-CADENCE_FILE="$HOME/.claude/.skillsmith-cadence"   # integer: nudge when last run is this many days old
+STAMP="$CONFIG/.skillsmith-last-sync"
+CADENCE_FILE="$CONFIG/.skillsmith-cadence"   # integer: nudge when last run is this many days old
 
 if [ "${1:-}" = "--mark-synced" ]; then
   touch "$STAMP"; echo "marked synced"; exit 0
@@ -36,11 +41,22 @@ if [ "${1:-}" = "--set-cadence" ] && [ -n "${2:-}" ]; then
   if [ "$2" -eq 0 ]; then echo "cadence set: never (nudges off)"; else echo "cadence set: every $2 days"; fi
   exit 0
 fi
-if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.0.2"; exit 0; fi
+if [ "${1:-}" = "--version" ]; then echo "skillsmith-drift-check 1.1.0"; exit 0; fi
+
+# Publish the bin dir of the copy that actually executes (manual ~/.claude/bin or
+# plugin cache) so SKILL.md resolves the helpers without guessing install layout.
+# It happens HERE, after argument handling, so `--version` no longer has the side
+# effect of writing it — a test that greps for the pointer must be proving that the
+# hook ran, not that someone asked for a version string.
+publish_bin_dir
 
 # Backstop GC: delete stale mining-corpus corpses (the concentrated 14-day
 # aggregate) if a Stage C run was abandoned before its own cleanup ran.
-for corpse in "${TMPDIR:-/tmp}"/skillsmith-corpus-* "$HOME/.claude/tmp"/user_messages.txt; do
+# Manifests are GC'd alongside corpora: a --plan the user then declined leaves one
+# behind holding every project name and per-session count, which SECURITY.md calls
+# out as often the most sensitive thing on the screen.
+for corpse in "${TMPDIR:-/tmp}"/skillsmith-corpus-* "${TMPDIR:-/tmp}"/skillsmith-manifest-* \
+              "$CONFIG/tmp"/user_messages.txt; do
   [ -f "$corpse" ] && find "$corpse" -mmin +120 -delete 2>/dev/null
 done
 
@@ -71,8 +87,8 @@ fi
 
 # Drift: -L follows symlinks (dotfiles/stow setups) both for traversal and for
 # comparing the TARGET's mtime, not the symlink's
-CHANGED=$(find -L "$HOME/.claude/skills" -name 'SKILL.md' -newer "$STAMP" 2>/dev/null \
-  | sed "s|$HOME/.claude/skills/||; s|/SKILL.md||" | sort | tr '\n' ' ')
+CHANGED=$(find -L "$CONFIG/skills" -name 'SKILL.md' -newer "$STAMP" 2>/dev/null \
+  | sed "s|$CONFIG/skills/||; s|/SKILL.md||" | sort | tr '\n' ' ')
 
 if [ -n "$CHANGED" ]; then
   echo "⚠️ skillsmith drift: skill(s) edited since last alias sync: ${CHANGED}— if triggers/aliases changed, run the skillsmith Stage B sync (or \`$0 --mark-synced\` if no alias impact)."

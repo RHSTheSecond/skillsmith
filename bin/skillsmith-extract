@@ -3,29 +3,48 @@
 own messages from Claude Code session transcripts, for skillsmith Stage C mining.
 
 Moves the scope/exclusion/cleanup invariants out of skill prose into code:
-  - --scope current mines ONLY the current project; --scope all mines every project
-    (a broader exposure — the skill must warn before choosing it)
+  - --scope current mines ONLY the current project (exact slug match, no fuzzy
+    fallback); --scope all mines every project — a broader exposure the skill must
+    warn about before choosing it
   - excludes the current session and any session where the `skillsmith` skill fired
     (prevents self-inflation of frequency evidence)
   - user-role text only; drops tool results, system reminders, command wrappers
   - corpus sanity floor: aborts (exit 4) if extraction is implausibly thin for the
-    session count, rather than reporting a false "no candidates"
-  - each line carries the message's ISO timestamp (cadence detection depends on it)
+    number of CANDIDATE transcripts — including the total-drift case where every
+    session yields nothing — rather than reporting a false "no candidates"
+  - each line carries the message's ISO timestamp
   - the corpus file is created 0600 and is NOT auto-deleted here; the CALLER owns
     its lifecycle. Prefer the wrapper form below so cleanup is trap-guaranteed:
-        CORPUS=$(skillsmith-extract --scope current --days 14 --print-path)
-        trap 'rm -f "$CORPUS"' EXIT INT TERM
+        CORPUS=$(skillsmith-extract --manifest "$MANIFEST")
+        trap 'rm -f "$CORPUS" "$MANIFEST"' EXIT INT TERM
+
+APPROVAL FLOW (the default; --unpinned opts out and says so):
+  --plan reports WHAT WOULD BE MINED — sessions, message counts, projects,
+  exclusions — without building a corpus, and pins that candidate set into a
+  manifest by recording each transcript's LENGTH AND CONTENT HASH at plan time.
+  The real run takes --manifest and reads exactly those bytes: a session that grew
+  afterwards is simply outside the approved set rather than a refusal, while a
+  session added, removed, truncated, or rewritten in place REFUSES (exit 5).
+
+  The manifest is a checksum against drift, not a security control: it is a plain
+  0600 file whose digest anyone who can read it can recompute. It stops "approve
+  one set, mine another" by accident, and the run re-prints the scope and counts so
+  a human can compare them against the report they approved.
 
 Usage:
-  skillsmith-extract [--scope current|all] [--days N] [--project SLUG]
-                     [--exclude-session UUID] [--min-per-session F] [--print-path]
+  skillsmith-extract --plan [--scope current|all] [--days N] [--project=SLUG]
+                     [--exclude-session UUID]              # report + manifest
+  skillsmith-extract --manifest PATH                       # the approved run
+  skillsmith-extract --unpinned [scoping flags]            # no approval record
   skillsmith-extract --version
 
-Output: prints the corpus path (always). Each corpus line:
-  <iso-timestamp>\t<project-slug>\t<session8>\t<message text, newlines->⏎>
+Output: prints the corpus path on stdout. Each corpus line:
+  <iso-timestamp>\t<project-slug>\t<session8>\t<message, newlines->⏎, tabs->␉>
 Exit codes: 0 ok · 3 usage/IO · 4 corpus sanity floor tripped (schema drift?)
+            5 manifest mismatch (approved set != current set — re-run --plan)
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -33,13 +52,18 @@ import tempfile
 import time
 from pathlib import Path
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
-PROJECTS = Path.home() / ".claude" / "projects"
+# Claude Code relocates its whole config tree when CLAUDE_CONFIG_DIR is set. A
+# hardcoded ~/.claude would enumerate, mine, and write to a directory the harness
+# never reads — every guarantee holding perfectly, on the wrong files.
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+PROJECTS = CONFIG / "projects"
 MAX_LEN = 1500
+MANIFEST_VERSION = 2
 NOISE_PREFIXES = ("<system-reminder", "<command-", "<local-command", "Caveat:",
                   "[Request interrupted", "<task-notification",
-                  "This session is being continued", "<local-command-stdout")
+                  "This session is being continued")
 
 
 def fail(code, msg):
@@ -49,111 +73,389 @@ def fail(code, msg):
 
 def session_fired_skillsmith(jsonl):
     """True if a Skill(skillsmith) tool_use appears anywhere in this session —
-    those sessions are excluded so mining never re-mines its own candidate talk."""
+    those sessions are excluded so mining never re-mines its own candidate talk.
+    Plugin-installed skills are namespaced (`skillsmith:skillsmith`), so match the
+    suffix too: missing those would silently re-mine every skillsmith session.
+    Returns None when the file cannot be read — unknown, never a quiet 'no'."""
     try:
         with open(jsonl, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if '"skillsmith"' not in line:
+                if "skillsmith" not in line:
                     continue
                 try:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 content = (ev.get("message") or {}).get("content")
-                if isinstance(content, list):
-                    for b in content:
-                        if (isinstance(b, dict) and b.get("type") == "tool_use"
-                                and b.get("name") == "Skill"
-                                and (b.get("input") or {}).get("skill") == "skillsmith"):
-                            return True
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                            and b.get("name") == "Skill"):
+                        continue
+                    skill = (b.get("input") or {}).get("skill") or ""
+                    if skill == "skillsmith" or skill.endswith(":skillsmith"):
+                        return True
     except OSError:
-        pass
+        return None
     return False
+
+
+def roots_for(scope, project):
+    """Which project directories are in scope. `current` is an EXACT slug match:
+    a substring fallback would quietly pull in every project whose name contains
+    this one's, while the report still said 'this project only'."""
+    if scope == "all":
+        return sorted(d for d in PROJECTS.iterdir() if d.is_dir())
+    slug = project or str(Path.cwd()).replace("/", "-")
+    root = PROJECTS / slug
+    if not root.is_dir():
+        near = sorted(d.name for d in PROJECTS.iterdir()
+                      if d.is_dir() and Path.cwd().name in d.name)
+        hint = ("\n  Closest slugs: " + ", ".join(near[:5])) if near else ""
+        fail(3, f"no transcripts for this project (looked for {slug}).\n"
+                f"  Pass the slug explicitly as --project=<slug> (slugs start with "
+                f"'-', so the '=' is required), or use --scope all.{hint}")
+    return [root]
+
+
+def discover(scope, project, cutoff, excluded):
+    """The candidate set: every transcript that passes scope/age/exclusion rules.
+
+    Returns (candidates, skipped) where candidates is a sorted list of
+    (session_id, project_slug, path) and skipped counts every reason a file was
+    dropped — including unreadable ones, so the --plan report has no silent bucket."""
+    candidates = []
+    skipped = {"excluded_session": 0, "older_than_window": 0,
+               "skillsmith_session": 0, "unreadable": 0}
+    for root in roots_for(scope, project):
+        proj = root.name.replace("-Users-", "").replace("-", "/", 2)
+        for f in sorted(root.glob("*.jsonl")):
+            if f.stem in excluded:
+                skipped["excluded_session"] += 1
+                continue
+            try:
+                if f.stat().st_mtime < cutoff:
+                    skipped["older_than_window"] += 1
+                    continue
+            except OSError:
+                skipped["unreadable"] += 1
+                continue
+            fired = session_fired_skillsmith(f)
+            if fired is None:
+                skipped["unreadable"] += 1
+                continue
+            if fired:
+                skipped["skillsmith_session"] += 1
+                continue
+            candidates.append((f.stem, proj, f))
+    candidates.sort()
+    return candidates, skipped
+
+
+def read_prefix(path, limit=None):
+    """(text, byte_length_read). Reading a fixed prefix is what lets an approved
+    set stay approved while a live session keeps growing: the tail written after
+    the plan is simply not part of what was approved."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read() if limit is None else fh.read(limit)
+    except OSError as e:
+        fail(3, f"cannot read candidate transcript {path}: {e.__class__.__name__} "
+                f"— refusing to report a partial corpus as complete")
+    return raw.decode("utf-8", errors="replace"), len(raw)
+
+
+def message_text(ev):
+    """User-authored text of one event, or None. Noise filtering happens per
+    BLOCK: the harness appends its own blocks (system reminders, command wrappers)
+    to real user turns, and joining first would both pollute the text and push a
+    short trigger word past MAX_LEN so it is dropped entirely."""
+    if ev.get("type") != "user":
+        return None
+    content = (ev.get("message") or {}).get("content")
+    if isinstance(content, str):
+        blocks = [content]
+    elif isinstance(content, list):
+        blocks = [b.get("text", "") for b in content
+                  if isinstance(b, dict) and b.get("type") == "text"]
+    else:
+        return None
+    kept = []
+    for b in blocks:
+        b = b.strip()
+        if not b or any(b.startswith(pre) for pre in NOISE_PREFIXES):
+            continue
+        kept.append(b)
+    text = " ".join(kept).strip()
+    return text or None
+
+
+def flatten(text):
+    """The corpus is tab-delimited and line-delimited, so every character that
+    could shift a field or split a record is replaced — tabs and BOTH newline
+    characters (a pasted CRLF block would otherwise leave a bare CR behind)."""
+    return (text.replace(chr(13), " ⏎ ").replace(chr(10), " ⏎ ")
+                .replace(chr(9), " ␉ "))
+
+
+def scan_text(blob):
+    """(messages, malformed_lines, too_long) from a transcript's text."""
+    out, malformed, too_long = [], 0, 0
+    for line in blob.splitlines():
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        text = message_text(ev)
+        if text is None:
+            continue
+        if len(text) > MAX_LEN:
+            too_long += 1
+            continue
+        out.append((ev.get("timestamp", ""), flatten(text)))
+    return out, malformed, too_long
+
+
+def corpus_line(ts, proj, sid, text):
+    """The exact bytes a message contributes to the corpus. The writer and the
+    counting both go through this, so what is reported is what gets written."""
+    return f"{ts}\t{proj}\t{sid[:8]}\t{text}\n"
+
+
+def survey(candidates, limits=None):
+    """Read each candidate ONCE. Returns (entries, messages, sessions-per-project,
+    malformed, too_long); each entry carries the bytes read, a hash of those exact
+    bytes, and the messages they yielded — everything the manifest and the corpus
+    writer both need, so no transcript is parsed twice."""
+    entries, projects = {}, {}
+    total = malformed_total = too_long_total = 0
+    for sid, proj, path in candidates:
+        key = f"{proj}/{sid}"
+        blob, nbytes = read_prefix(path, (limits or {}).get(key))
+        msgs, malformed, too_long = scan_text(blob)
+        entries[key] = {
+            "key": key, "project": proj, "session": sid,
+            "bytes": nbytes,
+            "prefix_sha": hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+            "messages": len(msgs), "malformed_lines": malformed,
+            "_msgs": msgs,
+        }
+        projects[proj] = projects.get(proj, 0) + 1
+        total += len(msgs)
+        malformed_total += malformed
+        too_long_total += too_long
+    return entries, total, projects, malformed_total, too_long_total
+
+
+def set_digest(entries):
+    """Digest over the exact candidate set AND the exact bytes of each transcript
+    that were approved. Keyed by project+session (the same session id can exist
+    under two projects) and over content, so a transcript rewritten in place with
+    the same message count refuses just like an added session does."""
+    payload = "\n".join(f"{k}:{e['bytes']}:{e['prefix_sha']}"
+                        for k, e in sorted(entries.items()))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_manifest(args, cutoff, entries, total, projects):
+    manifest = {
+        "manifest_version": MANIFEST_VERSION,
+        "tool_version": __version__,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "scope": args.scope,
+        "days": args.days,
+        "project": args.project,
+        "cutoff_epoch": cutoff,
+        "excluded_sessions": sorted(set(args.exclude_session)),
+        "min_per_session": args.min_per_session,
+        "projects": projects,
+        "sessions": [{k: v for k, v in e.items() if not k.startswith("_")}
+                     for _, e in sorted(entries.items())],
+        "totals": {"sessions": len(entries), "messages": total},
+        "digest": set_digest(entries),
+    }
+    fd, path = tempfile.mkstemp(prefix="skillsmith-manifest-", suffix=".json")
+    os.close(fd)
+    os.chmod(path, 0o600)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+    return path
+
+
+def plan(args):
+    cutoff = time.time() - args.days * 86400
+    candidates, skipped = discover(args.scope, args.project, cutoff,
+                                   set(args.exclude_session))
+    entries, total, projects, malformed, too_long = survey(candidates)
+    path = write_manifest(args, cutoff, entries, total, projects)
+
+    print("skillsmith-extract --plan — what mining WOULD read")
+    print("  (no corpus was written and nothing was shown to a model; counting the")
+    print("   messages does mean this command parsed them locally, on this machine)")
+    print(f"  scope           : {args.scope}"
+          + ("  (EVERY project on this machine — the broadest exposure)"
+             if args.scope == "all" else "  (this project only)"))
+    print(f"  window          : last {args.days} days")
+    print(f"  sessions        : {len(candidates)}")
+    print(f"  your messages   : {total}")
+    print(f"  projects        : {len(projects)}")
+    for proj, n in sorted(projects.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"      - {proj}  ({n} session{'s' if n != 1 else ''})")
+    print("  exclusions applied:")
+    print(f"      - current/named sessions excluded : {skipped['excluded_session']}")
+    print(f"      - sessions where skillsmith ran   : {skipped['skillsmith_session']}")
+    print(f"      - outside the {args.days}-day window"
+          f"{'':<9}: {skipped['older_than_window']}")
+    print(f"      - transcripts that could not be read: {skipped['unreadable']}")
+    print("      - user-authored text only (no tool output, no assistant text)")
+    print(f"      - messages over {MAX_LEN} chars dropped: {too_long}")
+    if malformed:
+        print(f"  unparseable lines: {malformed} (transcript lines that were not "
+              f"valid JSON — usually a session still being written; a large number "
+              f"means the format drifted)")
+    print("  NOTE: this report itself names your projects — project names are data.")
+    print(f"  candidate-set digest : {set_digest(entries)[:16]}…")
+    print(f"manifest: {path}")
+    print("Approve, then run the real extraction pinned to this exact set:",
+          file=sys.stderr)
+    print(f"  skillsmith-extract --manifest {path}", file=sys.stderr)
+
+
+def emit_corpus(entries, candidate_count, sanity_floor):
+    fd, corpus = tempfile.mkstemp(prefix="skillsmith-corpus-", suffix=".tsv")
+    os.close(fd)
+    os.chmod(corpus, 0o600)
+    lines = 0
+    with open(corpus, "w", encoding="utf-8") as out:
+        for key in sorted(entries):
+            e = entries[key]
+            for ts, text in e["_msgs"]:
+                out.write(corpus_line(ts, e["project"], e["session"], text))
+                lines += 1
+
+    # Floor on CANDIDATES, not on the sessions that produced something. Counting
+    # only producers makes total schema drift — every session yielding nothing —
+    # divide by zero and pass silently, which is the exact failure this exists
+    # to catch.
+    if candidate_count and lines < sanity_floor * candidate_count:
+        os.unlink(corpus)
+        fail(4, f"corpus sanity floor tripped: only {lines} messages from "
+                f"{candidate_count} candidate transcripts (< {sanity_floor}/session)"
+                + (" — NOTHING parsed at all, which means the transcript format "
+                   "changed" if lines == 0 else " — likely transcript schema drift")
+                + "; ABORTING rather than reporting a false 'no candidates'.")
+    return corpus, lines
+
+
+def pinned_run(args):
+    """Extraction bound to an approved --plan manifest. Re-discovers with the
+    manifest's own parameters, reads exactly the approved bytes of each approved
+    transcript, and refuses on any set difference."""
+    mpath = Path(args.manifest).expanduser()
+    try:
+        with open(mpath, encoding="utf-8") as fh:
+            man = json.load(fh)
+    except (OSError, ValueError) as e:
+        fail(3, f"unreadable manifest {mpath}: {e} — nothing extracted")
+    if man.get("manifest_version") != MANIFEST_VERSION:
+        fail(3, f"manifest version {man.get('manifest_version')} != "
+                f"{MANIFEST_VERSION} — re-run --plan with this version of the tool")
+
+    approved = {s["key"]: s for s in man["sessions"]}
+    candidates, _ = discover(man["scope"], man.get("project"), man["cutoff_epoch"],
+                             set(man.get("excluded_sessions", [])))
+    limits = {k: v["bytes"] for k, v in approved.items()}
+    entries, _, _, _, _ = survey(candidates, limits)
+
+    if set_digest(entries) != man["digest"]:
+        added = sorted(set(entries) - set(approved))
+        removed = sorted(set(approved) - set(entries))
+        changed = sorted(k for k in set(entries) & set(approved)
+                         if entries[k]["prefix_sha"] != approved[k]["prefix_sha"]
+                         or entries[k]["bytes"] != approved[k]["bytes"])
+        detail = []
+        if added:
+            detail.append(f"{len(added)} session(s) added ({', '.join(added[:2])})")
+        if removed:
+            detail.append(f"{len(removed)} removed")
+        if changed:
+            detail.append(f"{len(changed)} rewritten or truncated since approval "
+                          f"({', '.join(changed[:2])})")
+        fail(5, "REFUSING: the candidate set changed after --plan was approved — "
+                + ("; ".join(detail) or "digest mismatch")
+                + ". Re-run --plan, show the new report, and re-approve. "
+                  "(A session that merely GREW does not cause this: only the bytes "
+                  "approved at plan time are read.)")
+
+    floor = man.get("min_per_session", args.min_per_session)
+    corpus, lines = emit_corpus(entries, len(candidates), floor)
+    if lines != man["totals"]["messages"]:
+        os.unlink(corpus)
+        fail(5, f"REFUSING: extracted {lines} messages but the approved plan said "
+                f"{man['totals']['messages']} — re-run --plan.")
+    print(corpus)
+    # Re-state what was honored so a human can compare it against the report they
+    # approved: the manifest carries its own scope, and a checksum cannot notice
+    # that someone edited the thing being checksummed.
+    print(f"# pinned run: scope={man['scope']}, {man['totals']['sessions']} sessions, "
+          f"{lines} messages, digest {man['digest'][:16]}… "
+          f"(compare these to the --plan report you approved)", file=sys.stderr)
+
+
+def unpinned_run(args):
+    cutoff = time.time() - args.days * 86400
+    candidates, _ = discover(args.scope, args.project, cutoff,
+                             set(args.exclude_session))
+    entries, _, _, _, _ = survey(candidates)
+    corpus, lines = emit_corpus(entries, len(candidates), args.min_per_session)
+    print(corpus)
+    print(f"# {lines} messages from {len(candidates)} sessions "
+          f"(scope={args.scope}, {args.days}d) — UNPINNED: no --plan report was "
+          f"approved for this set", file=sys.stderr)
 
 
 def extract():
     p = argparse.ArgumentParser(add_help=True)
     p.add_argument("--scope", choices=("current", "all"), default="current")
     p.add_argument("--days", type=int, default=14)
-    p.add_argument("--project", help="project slug for --scope current (default: cwd-derived)")
+    p.add_argument("--project",
+                   help="project slug for --scope current (default: cwd-derived). "
+                        "Slugs start with '-', so pass it as --project=-Users-you-repo")
     p.add_argument("--exclude-session", action="append", default=[],
                    help="session UUID(s) to exclude (e.g. the live session)")
     p.add_argument("--min-per-session", type=float, default=3.0,
-                   help="corpus sanity floor: min avg messages/session before abort")
+                   help="corpus sanity floor: min avg messages/candidate before abort")
     p.add_argument("--print-path", action="store_true", help="(default) print corpus path")
+    p.add_argument("--plan", action="store_true",
+                   help="report what WOULD be mined + write a pinned manifest; extract nothing")
+    p.add_argument("--manifest", metavar="PATH",
+                   help="extract exactly the candidate set an approved --plan pinned")
+    p.add_argument("--unpinned", action="store_true",
+                   help="extract with NO approved manifest — the pre-1.1 behavior. "
+                        "Must be explicit, so a dropped flag cannot silently mine "
+                        "an unapproved set.")
     p.add_argument("--version", action="version", version=f"skillsmith-extract {__version__}")
     args = p.parse_args()
 
     if not PROJECTS.is_dir():
         fail(3, f"no transcripts dir: {PROJECTS}")
+    if sum(bool(x) for x in (args.plan, args.manifest, args.unpinned)) > 1:
+        fail(3, "--plan, --manifest and --unpinned are mutually exclusive")
 
-    cutoff = time.time() - args.days * 86400
-    if args.scope == "current":
-        slug = args.project or str(Path.cwd()).replace("/", "-")
-        roots = [PROJECTS / slug]
-        if not roots[0].is_dir():
-            # cwd-derived slug may not match exactly; fall back to substring match
-            base = Path.cwd().name
-            roots = [d for d in PROJECTS.iterdir() if d.is_dir() and base in d.name] or roots
+    if args.plan:
+        plan(args)
+    elif args.manifest:
+        pinned_run(args)
+    elif args.unpinned:
+        unpinned_run(args)
     else:
-        roots = [d for d in PROJECTS.iterdir() if d.is_dir()]
-
-    excluded = set(args.exclude_session)
-    fd, corpus = tempfile.mkstemp(prefix="skillsmith-corpus-", suffix=".tsv")
-    os.close(fd)
-    os.chmod(corpus, 0o600)
-
-    lines, sessions = 0, set()
-    with open(corpus, "w", encoding="utf-8") as out:
-        for root in roots:
-            if not root.is_dir():
-                continue
-            for f in root.glob("*.jsonl"):
-                if f.stem in excluded or f.stat().st_mtime < cutoff:
-                    continue
-                if session_fired_skillsmith(f):
-                    continue
-                proj = root.name.replace("-Users-", "").replace("-", "/", 2)
-                sid = f.stem[:8]
-                try:
-                    with open(f, encoding="utf-8", errors="replace") as fh:
-                        for line in fh:
-                            try:
-                                ev = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if ev.get("type") != "user":
-                                continue
-                            content = (ev.get("message") or {}).get("content")
-                            if isinstance(content, str):
-                                text = content
-                            elif isinstance(content, list):
-                                text = " ".join(b.get("text", "") for b in content
-                                                if isinstance(b, dict) and b.get("type") == "text")
-                            else:
-                                continue
-                            text = text.strip()
-                            if not text or len(text) > MAX_LEN:
-                                continue
-                            if any(text.startswith(pre) for pre in NOISE_PREFIXES):
-                                continue
-                            ts = ev.get("timestamp", "")
-                            sessions.add(f.stem)
-                            out.write(f"{ts}\t{proj}\t{sid}\t{text.replace(chr(10), ' ⏎ ')}\n")
-                            lines += 1
-                except OSError:
-                    continue
-
-    n_sessions = len(sessions)
-    if n_sessions and lines < args.min_per_session * n_sessions:
-        os.unlink(corpus)
-        fail(4, f"corpus sanity floor tripped: only {lines} messages from {n_sessions} "
-                f"sessions (< {args.min_per_session}/session) — likely transcript schema "
-                f"drift; ABORTING rather than reporting a false 'no candidates'.")
-
-    print(corpus)
-    print(f"# {lines} messages from {n_sessions} sessions "
-          f"(scope={args.scope}, {args.days}d)", file=sys.stderr)
+        fail(3, "refusing to mine without an approved set. Run --plan first, show "
+                "the report, then extract with --manifest <path> — or pass "
+                "--unpinned to mine with no approval record.")
 
 
 if __name__ == "__main__":
