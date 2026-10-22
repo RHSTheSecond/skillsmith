@@ -61,7 +61,11 @@ Usage:
 Exit codes: 0 ok · 3 usage / unreadable or malformed registry (nothing written)
 """
 import argparse
-import fcntl
+try:
+    import fcntl                       # POSIX
+except ImportError:                    # Windows: no fcntl; lock with msvcrt instead
+    fcntl = None
+    import msvcrt
 import json
 import os
 import re
@@ -173,14 +177,24 @@ class registry_lock(object):
         Path(self.lockpath).parent.mkdir(parents=True, exist_ok=True)
         self.fh = open(self.lockpath, "a+")
         try:
-            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+            if fcntl:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+            else:
+                # msvcrt locks a byte range from the current position; lock byte 0. LK_LOCK retries
+                # for ~10 s, then raises OSError, which (like flock) is not a reason to refuse.
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_LOCK, 1)
         except OSError:
             pass          # a filesystem without locking is not a reason to refuse
         return self
 
     def __exit__(self, *exc):
         try:
-            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+            if fcntl:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+            else:
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
         self.fh.close()
